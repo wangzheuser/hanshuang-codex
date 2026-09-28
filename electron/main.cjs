@@ -11,6 +11,7 @@ const { spawn, execFile } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const plat = require("./platform.cjs");
 
 // 应用名由构建变体决定（scripts/build.mjs 写入 variant.json）
 let APP_NAME = "寒霜破甲工具";
@@ -291,6 +292,68 @@ function clearPromptsArgs(targetId) {
   return ["-File", p("scripts", "clear-injected-prompts.ps1"), "-Apply", "-Targets", t];
 }
 
+// ---------- 按平台选执行器（判定逻辑集中在 platform.cjs） ----------
+
+function nodeInjectCtx(targetId, promptFile, label) {
+  const log = (text) => send("tool:log", { label, text: text + "\n" });
+  const base = {
+    toolDir: toolDir(), // 模块要的是解析后的目录字符串，不是 toolDir 函数本身
+    homeDir: homeDir(),
+    log,
+    sourcePrompt: p(promptFile),
+  };
+  if (targetId === "zcode") return { ...base, zcodeHome: "" };
+  if (targetId === "codex") {
+    return {
+      ...base,
+      codexHome: codexHome(),
+      injectAgents: true,
+      agentsKnown: knownPromptPaths(),
+      // V5 双提示词只注入提示词、不装技能（与 installArgs 的 -NoSkills 一致）
+      noSkills: !!ASTRA_PROMPTS[promptFile],
+      skillsSourceDir: p("codex-skills-v4"),
+    };
+  }
+  return {
+    ...base,
+    skillsSourceName: "codex-skills-v4",
+    skillsSourceDir: p("codex-skills-v4"),
+    noSkills: false,
+    uid: "",
+    // 国内版数据目录固定 ~/.workbuddy，必须显式钉住，否则自动探测会跑到国际版上
+    configDirExplicit: targetId === "workbuddy-cn" ? path.join(homeDir(), ".workbuddy") : "",
+  };
+}
+
+/**
+   注入器抛错也必须回一个完整结果：否则 IPC 的 promise 直接 reject，
+   渲染层 await 拿不到值，界面永远停在「执行中…」（实测踩过）。
+*/
+function runNodeInjector(fn, ctx, label) {
+  send("tool:status", { label, state: "running" });
+  try {
+    return fn(ctx);
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    send("tool:log", { label, text: "\n[注入异常] " + msg + "\n" });
+    return { ok: false, code: -1, out: msg, timedOut: false, error: msg };
+  }
+}
+
+/** 该平台还没移植的目标：给可读原因，而不是 spawn ENOENT 的「退出码 -1」。 */
+function unsupportedResult(targetId, label) {
+  const msg = plat.unsupportedMessage(targetId);
+  send("tool:log", { label, text: "\n[未适配] " + msg + "\n" });
+  return {
+    ok: false,
+    code: -1,
+    out: msg,
+    timedOut: false,
+    error: msg,
+    installed: installedSnapshot().installed,
+  };
+}
+
 // ---------- 运行 powershell ----------
 
 function send(channel, payload) {
@@ -348,7 +411,11 @@ function runPowerShell(args, label, timeoutMs) {
     ps.on("error", (err) => {
       if (childTimer) clearTimeout(childTimer);
       child = null;
-      resolve({ ok: false, code: -1, out, timedOut, error: String(err && err.message) });
+      // spawn 失败（ENOENT 等）不会产生任何 stdout/stderr，界面上的日志区会是空的，
+      // 只剩一句没信息量的「退出码 -1」。这里把原因补进日志和结果里。
+      const msg = String((err && err.message) || err);
+      send("tool:log", { label, text: "\n[无法启动命令] " + msg + "\n" });
+      resolve({ ok: false, code: -1, out, timedOut, error: msg });
     });
 
     ps.on("close", (code) => {
@@ -771,16 +838,33 @@ function registerIpc() {
     installed: installedSnapshot().installed,
     autoInstall: loadState().autoInstall,
     version: app.getVersion(),
+    platform: plat.capabilities(),
   }));
 
   ipcMain.handle("tool:install", async (_e, targetId, promptFile) => {
+    const label = `安装 ${targetId}`;
+    const exec = plat.executorFor(targetId);
+    if (exec === "unsupported") return unsupportedResult(targetId, label);
+    if (exec === "node") {
+      const res = runNodeInjector(
+        plat.nodeInjector(targetId).install,
+        nodeInjectCtx(targetId, promptFile, label),
+        label
+      );
+      if (res.ok) {
+        const st = loadState();
+        st.installed[targetId] = PROMPT_LABEL[promptFile] || true;
+        saveState({ installed: st.installed });
+      }
+      return { ...res, installed: installedSnapshot().installed };
+    }
     let args;
     try {
       args = installArgs(targetId, promptFile);
     } catch (e) {
       // 参数准备失败（比如随包提示词缺失）也要回一个完整结果，界面才好显示原因
       const msg = String((e && e.message) || e);
-      send("tool:log", { label: `安装 ${targetId}`, text: "\n[错误] " + msg + "\n" });
+      send("tool:log", { label, text: "\n[错误] " + msg + "\n" });
       return {
         ok: false,
         code: -1,
@@ -790,7 +874,7 @@ function registerIpc() {
         installed: installedSnapshot().installed,
       };
     }
-    const res = await runPowerShell(args, `安装 ${targetId}`, INSTALL_TIMEOUT);
+    const res = await runPowerShell(args, label, INSTALL_TIMEOUT);
     if (res.ok) {
       const st = loadState();
       st.installed[targetId] = PROMPT_LABEL[promptFile] || true;
@@ -800,7 +884,25 @@ function registerIpc() {
   });
 
   ipcMain.handle("tool:uninstall", async (_e, targetId) => {
-    const res = await runPowerShell(uninstallArgs(targetId), `卸载 ${targetId}`, UNINSTALL_TIMEOUT);
+    const label = `卸载 ${targetId}`;
+    const exec = plat.executorFor(targetId);
+    if (exec === "unsupported") return unsupportedResult(targetId, label);
+    if (exec === "node") {
+      // Node 卸载自己就把注入内容还原/删净（WorkBuddy 用 .bak-inject，ZCode 用
+      // AGENTS.md.backup-*），下面那段 PowerShell 兜底清扫在非 Windows 上必然 ENOENT，跳过。
+      const res = runNodeInjector(
+        plat.nodeInjector(targetId).uninstall,
+        nodeInjectCtx(targetId, "", label),
+        label
+      );
+      if (res.ok) {
+        const st = loadState();
+        delete st.installed[targetId];
+        saveState({ installed: st.installed });
+      }
+      return { ...res, installed: installedSnapshot().installed };
+    }
+    const res = await runPowerShell(uninstallArgs(targetId), label, UNINSTALL_TIMEOUT);
     if (res.ok) {
       const st = loadState();
       delete st.installed[targetId];

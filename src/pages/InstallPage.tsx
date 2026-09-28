@@ -12,6 +12,7 @@ type Props = {
   status: string;
   level: StatusLevel;
   logText: string;
+  unsupportedReason?: string;
   onInstall: (file: string, label?: string) => void;
   onUninstall: () => void;
   onRestart: () => void;
@@ -24,6 +25,7 @@ export function InstallPage({
   status,
   level,
   logText,
+  unsupportedReason = "",
   onInstall,
   onUninstall,
   onRestart,
@@ -120,21 +122,39 @@ export function InstallPage({
         </div>
         )}
 
+        {unsupportedReason && (
+          <div className="panel-card" style={{ padding: "10px 12px", marginBottom: 12 }}>
+            <p className="settings-card-description" style={{ margin: 0 }}>
+              {unsupportedReason}
+            </p>
+          </div>
+        )}
+
         <div className="app-inline-actions">
           <button
             type="button"
             className="btn btn-primary"
-            disabled={busy}
+            disabled={busy || Boolean(unsupportedReason)}
             onClick={startInstall}
           >
             {busy ? "执行中…" : isInstalled ? "重新安装" : "安装"}
           </button>
           {target.id === "codex" && (
-            <button type="button" className="btn btn-secondary" disabled={busy} onClick={onRestart}>
+            <button
+              type="button"
+              className="btn btn-secondary"
+              disabled={busy || Boolean(unsupportedReason)}
+              onClick={onRestart}
+            >
               重启 Codex
             </button>
           )}
-          <button type="button" className="btn btn-ghost" disabled={busy} onClick={onUninstall}>
+          <button
+            type="button"
+            className="btn btn-ghost"
+            disabled={busy || Boolean(unsupportedReason)}
+            onClick={onUninstall}
+          >
             {target.uninstallLabel}
           </button>
         </div>

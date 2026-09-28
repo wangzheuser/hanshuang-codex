@@ -10,7 +10,7 @@ import {
   RELAY_LINK,
   HELP_LINK,
 } from "./data/targets";
-import { hs, type InstalledMap, type Skill } from "./lib/hs";
+import { hs, type InstalledMap, type PlatformCaps, type Skill } from "./lib/hs";
 import { cx } from "./lib/cx";
 import {
   IconBookOpen,
@@ -71,6 +71,7 @@ export function App() {
   const [logText, setLogText] = useState("");
   const [toast, setToast] = useState<string | null>(null);
   const [toastLevel, setToastLevel] = useState<"success" | "error">("success");
+  const [platform, setPlatform] = useState<PlatformCaps | null>(null);
   const autoRan = useRef(false);
 
   // 窗口标题跟随变体（免费版 / 付费版 Pro）
@@ -82,6 +83,7 @@ export function App() {
     hs.state().then((s) => {
       setInstalled(s.installed || {});
       setAutoInstallState(!!s.autoInstall);
+      setPlatform(s.platform || null);
     });
     hs.listSkills().then(setSkills);
   }, []);
@@ -126,7 +128,7 @@ export function App() {
       setStatus("安装超时，已强制终止");
       setLevel("err");
     } else {
-      setStatus("安装失败（退出码 " + res.code + "）");
+      setStatus("安装失败：" + (res.error || "退出码 " + res.code));
       setLevel("err");
     }
     setBusy(false);
@@ -140,7 +142,7 @@ export function App() {
     setBusy(true);
     const res = await hs.uninstall(targetId);
     setInstalled(res.installed || {});
-    setStatus(res.ok ? "已卸载 · 技能已一并清除" : "卸载失败（退出码 " + res.code + "）");
+    setStatus(res.ok ? "已卸载 · 技能已一并清除" : "卸载失败：" + (res.error || "退出码 " + res.code));
     setLevel(res.ok ? "ok" : "err");
     setBusy(false);
     reloadSkills();
@@ -287,6 +289,11 @@ export function App() {
                 status={status}
                 level={level}
                 logText={logText}
+                unsupportedReason={
+                  platform?.targets[current.id]?.executor === "unsupported"
+                    ? platform.targets[current.id].reason
+                    : ""
+                }
                 onInstall={(file, label) => runInstall(current.id, file, label)}
                 onUninstall={() => runUninstall(current.id)}
                 onRestart={runRestart}

@@ -16,10 +16,20 @@ export type RestartResult = { ok: boolean; code?: number; out?: string; error?: 
 
 export type Skill = { name: string; desc: string; enabled: boolean };
 
+/** 主进程 platform.cjs 给出的能力表：某个目标在当前系统上用哪种执行器。 */
+export type PlatformCaps = {
+  platform: string;
+  platformName: string;
+  isWindows: boolean;
+  homeDir: string;
+  targets: Record<string, { executor: "powershell" | "node" | "unsupported"; reason: string }>;
+};
+
 export type AppState = {
   installed: InstalledMap;
   autoInstall: boolean;
   version: string;
+  platform?: PlatformCaps;
 };
 
 export type LogPayload = { label: string; text: string };

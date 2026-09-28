@@ -83,6 +83,15 @@ function Get-ConfigValueLine([string]$Text) {
     return $null
 }
 
+# 顶层区 = 第一个 [table] 头之前的部分。model_instructions_file 只有写在顶层才全局生效；
+# 按「文件里第一个匹配」读写，一旦顶层那行被 Codex 自己重写掉（它确实会重写 config.toml），
+# 就会误改到 [profiles.xxx] 里的同名行 —— 表现为 profile 指向被换掉且顶层行丢失。
+function Split-ConfigTopLevel([string]$Text) {
+    $m = [regex]::Match($Text, '(?m)^[ \t]*\[')
+    $cut = if ($m.Success) { $m.Index } else { $Text.Length }
+    return @{ Top = $Text.Substring(0, $cut); Rest = $Text.Substring($cut) }
+}
+
 if ([string]::IsNullOrWhiteSpace($CodexHome)) {
     if ($env:CODEX_HOME) {
         $CodexHome = $env:CODEX_HOME
@@ -320,18 +329,19 @@ if ($Uninstall) {
     if (Test-Path -LiteralPath $configPath) {
         $current = Read-Utf8 $configPath
         $pattern = '(?m)^\s*model_instructions_file\s*=\s*.*(?:\r?\n|$)'
-    $isOwnPrev = $false
-    if ($state -and $state.previousLine) {
-        $pl = [string]$state.previousLine
-        if ($pl -match "managed-prompts") { $isOwnPrev = $true }
-    }
-    if ($state -and $state.hadLine -and $state.previousLine -and -not $isOwnPrev) {
-            $replacement = [string]$state.previousLine + [Environment]::NewLine
-            $current = [regex]::Replace($current, $pattern, $replacement, 1)
-        } else {
-            $current = [regex]::Replace($current, $pattern, '', 1)
+        $tl = Split-ConfigTopLevel $current
+        $isOwnPrev = $false
+        if ($state -and $state.previousLine) {
+            $pl = [string]$state.previousLine
+            if ($pl -match "managed-prompts") { $isOwnPrev = $true }
         }
-        Write-Utf8NoBom $configPath ($current.TrimEnd() + [Environment]::NewLine)
+        # 只在顶层区增删，profile 段里的同名行一律不碰
+        $newTop = if ($state -and $state.hadLine -and $state.previousLine -and -not $isOwnPrev) {
+            [regex]::Replace($tl.Top, $pattern, ([string]$state.previousLine + [Environment]::NewLine), 1)
+        } else {
+            [regex]::Replace($tl.Top, $pattern, '', 1)
+        }
+        Write-Utf8NoBom $configPath (($newTop + $tl.Rest).TrimEnd() + [Environment]::NewLine)
     }
     # 删除提示词文件：优先按安装时记录的 targetPrompt（卸载时 -SourcePrompt 为空，
     # Split-Path -Leaf 派生会失效，导致 managed-prompts 下的文件残留）
@@ -410,7 +420,29 @@ if (-not (Test-Path -LiteralPath $SourcePrompt -PathType Leaf)) {
 New-Item -ItemType Directory -Force -Path $CodexHome, $managedDir | Out-Null
 $configExisted = Test-Path -LiteralPath $configPath
 $configText = if ($configExisted) { Read-Utf8 $configPath } else { '' }
-$previousLine = Get-ConfigValueLine $configText
+$configTop = Split-ConfigTopLevel $configText
+$previousLine = Get-ConfigValueLine $configTop.Top
+
+# 「用户原本那一行是什么」必须首次安装定下、之后逐次继承，两种情况都要覆盖：
+#   · 当前行是上一次安装写的托管路径
+#   · 当前行根本不存在 —— Codex 会自己重写 config.toml 并丢掉 model_instructions_file，
+#     此时若按「没有就是用户原本没有」记录，卸载会直接删行，用户原本的指向永久丢失（实测踩过）
+$carriedState = $null
+if (Test-Path -LiteralPath $statePath) {
+    try { $carriedState = Read-Utf8 $statePath | ConvertFrom-Json } catch { $carriedState = $null }
+}
+if ($carriedState -and ($carriedState.PSObject.Properties.Name -contains 'previousLine')) {
+    $carried = if ($carriedState.previousLine) { [string]$carriedState.previousLine } else { $null }
+    if ($carried -and -not $carried.Contains('managed-prompts')) {
+        if ($previousLine -ne $carried) {
+            $previousLine = $carried
+            Write-Host ("Carried original model_instructions_file: " + $previousLine)
+        }
+    } elseif (-not $carried -and $previousLine -and ([string]$previousLine).Contains('managed-prompts')) {
+        $previousLine = $null
+        Write-Host "Carried original state: user had no model_instructions_file"
+    }
+}
 
 Copy-Item -LiteralPath $SourcePrompt -Destination $targetPrompt -Force
 
@@ -427,12 +459,13 @@ if ($promptText.Contains('__CODEX_HOME__')) {
 $configPromptPath = $targetPrompt.Replace('\', '/')
 $newLine = 'model_instructions_file = "' + $configPromptPath.Replace('"', '\"') + '"'
 $linePattern = '(?m)^\s*model_instructions_file\s*=\s*.*$'
-if ([regex]::IsMatch($configText, $linePattern)) {
-    $configText = [regex]::Replace($configText, $linePattern, $newLine, 1)
+# 只在顶层区内增删，profile 段里的同名行一律不碰
+$newTop = if ([regex]::IsMatch($configTop.Top, $linePattern)) {
+    [regex]::Replace($configTop.Top, $linePattern, $newLine, 1)
 } else {
-    $configText = $newLine + [Environment]::NewLine + $configText
+    $newLine + [Environment]::NewLine + $configTop.Top
 }
-Write-Utf8NoBom $configPath ($configText.TrimEnd() + [Environment]::NewLine)
+Write-Utf8NoBom $configPath (($newTop + $configTop.Rest).TrimEnd() + [Environment]::NewLine)
 
 # ---------- AGENTS.md 注入（-InjectAgents，V5 双提示词用）----------
 # Codex 原生会读 <CodexHome>\AGENTS.md 作为全局指令；config.toml 里的
@@ -515,8 +548,15 @@ foreach ($old in $promptHistory) {
     }
 }
 
-# 记录安装前的禁用状态（用于卸载恢复）；必须在禁用动作之前读
-$prevDisabled = Get-DisabledSkills
+# 记录安装前的禁用状态（用于卸载恢复）。必须首次安装定下后逐次继承：
+# 不能每次安装都重读 config.toml —— 上一次安装写的 [[skills.config]] 已经在里面了，
+# 重读会把我们自己的禁用当成用户原本禁用的，卸载时又原样还回去。
+$prevDisabled = @()
+if ($prevState -and $prevState.PSObject.Properties.Name -contains 'previousDisabledSkills') {
+    $prevDisabled = @($prevState.previousDisabledSkills)
+} else {
+    $prevDisabled = @(Get-DisabledSkills)
+}
 
 if ($NoSkills) {
     # 只写提示词：不装技能、不装随附包、也不清理或禁用 skills 目录里已有的任何技能。
