@@ -12,6 +12,8 @@ install-state.json
 memory.json
 .env
 .env.local
+# 本仓库被 WorkBuddy 当作工作区打开时，它在自己数据目录旁写的按项目记忆
+.workbuddy-ai/
 
 # 旧版 Python 工具遗留
 __pycache__/
