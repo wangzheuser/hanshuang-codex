@@ -1,2 +1,0 @@
-frida>=16
-frida-tools>=12

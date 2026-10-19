@@ -25,9 +25,21 @@ export type PlatformCaps = {
   targets: Record<string, { executor: "powershell" | "node" | "unsupported"; reason: string }>;
 };
 
+/** memory/ 下正在使用的提示词文件；null = 用户还没填内容。 */
+export type MemoryPrompt = { path: string; name: string; chars: number } | null;
+
+/** 随包 Seep 逆向工作台状态。 */
+export type SeepState = {
+  /** 随包工具链是否完整（resources/seep-kit/setup/install.ps1 存在）。 */
+  kit: boolean;
+  /** 是否已部署到 ~/.pi/agent（mcp.json 里有 seep 条目）。 */
+  installed: boolean;
+  /** 随包工作台版本号。 */
+  version: string;
+};
+
 export type AppState = {
   installed: InstalledMap;
-  autoInstall: boolean;
   version: string;
   platform?: PlatformCaps;
 };
@@ -38,12 +50,18 @@ export type NotifyPayload = { level: "info" | "warn"; text: string };
 
 export type HsApi = {
   state(): Promise<AppState>;
-  install(targetId: string, promptFile: string): Promise<InstallResult>;
+  memory(): Promise<MemoryPrompt>;
+  install(targetId: string): Promise<InstallResult>;
   uninstall(targetId: string): Promise<InstallResult>;
+  /** 装回原始记忆（仅 WorkBuddy）：还原安装前的记忆档案，保留技能库。 */
+  restoreMemory(targetId: string): Promise<InstallResult>;
   restartCodex(): Promise<RestartResult>;
+  seepState(): Promise<SeepState>;
+  seepInstall(): Promise<InstallResult>;
+  seepUninstall(): Promise<InstallResult>;
+  seepVerify(): Promise<InstallResult>;
   listSkills(): Promise<Skill[]>;
   saveSkills(disabled: string[]): Promise<{ ok: boolean; error?: string }>;
-  setAutoInstall(value: boolean): Promise<{ autoInstall: boolean }>;
   openQQ(url: string): Promise<{ ok: boolean }>;
   quit(): Promise<{ ok: boolean }>;
   win(action: "minimize" | "maximize" | "close"): Promise<{ ok: boolean }>;

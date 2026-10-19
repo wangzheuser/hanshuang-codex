@@ -19,6 +19,7 @@
 #   .\install-workbuddy.ps1 -NoSkills                        # 只注入记忆，不装 skills
 #   .\install-workbuddy.ps1 -KillApp -Restart                # 注入前结束进程、注入后拉起
 #   .\install-workbuddy.ps1 -Uninstall                       # 一键还原（记忆 + 开关 + skills）
+#   .\install-workbuddy.ps1 -RestoreMemory                   # 只装回原始记忆（停重注入，保留 skills）
 #   .\install-workbuddy.ps1 -Status                          # 只读状态
 
 [CmdletBinding()]
@@ -35,6 +36,10 @@ param(
     [switch]$KillApp,
     [switch]$Restart,
     [switch]$Uninstall,
+    # 只把记忆装回安装前的原始版本（云记忆档案 + MEMORY.md），并停掉守护的自动重注入。
+    # 技能库和记忆开关都不动 —— 界面上的「装回原始记忆」按钮走这条路径：
+    # 用户想用回自己的记忆时，不必为了记忆把整套破甲连技能一起卸掉。
+    [switch]$RestoreMemory,
     [switch]$Status
 )
 
@@ -66,6 +71,11 @@ if ($PSVersionTable.PSVersion.Major -lt 5) {
 }
 $Root = if ($ScriptRoot) { $ScriptRoot } else { $PSScriptRoot }
 if (-not $Root) { $Root = Split-Path -Parent $MyInvocation.MyCommand.Path }
+# 统一 UTF-8 输出：避免按系统代码页（GBK/437…）写 stdout 导致界面日志乱码
+try {
+    $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+} catch { }
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $MEM_VERSION = 999999      # 高版本号：程序写档案时 incoming < existing 会被判 stale_version 拒绝
 $SKILL_MANIFEST = '.hanshuang-skills.json'
@@ -81,6 +91,18 @@ function Read-Utf8([string]$Path) { return [System.IO.File]::ReadAllText($Path, 
 function Get-Sha([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) { return '' }
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+}
+# 取 Memory Block 段正文。结束锚点必须盯 RAW_JSON 注释，**不能**盯「第一个空行+---」：
+# 提示词正文自带 markdown 分隔线（实测这份有 17 个），非贪婪正则会在第一个 --- 处截断,
+# 后果是校验误报「memoryBlock 不可解析」，卸载/清理也只清掉前半段。
+function Get-MemoryBlockBody([string]$Text) {
+    if ([string]::IsNullOrEmpty($Text)) { return '' }
+    $m = [regex]::Match($Text, '(?s)## Memory Block[ \t]*\r?\n\r?\n(?<b>.*?)\r?\n\r?\n---\r?\n\r?\n<!--\s*RAW_JSON_START')
+    if ($m.Success) { return $m.Groups['b'].Value }
+    # 兜底：没有 RAW_JSON 标记的旧格式，只能按第一个分隔线截断
+    $m2 = [regex]::Match($Text, '(?s)## Memory Block[ \t]*\r?\n\r?\n(?<b>.*?)\r?\n\r?\n---')
+    if ($m2.Success) { return $m2.Groups['b'].Value }
+    return ''
 }
 function Set-ArchiveReadOnly([string]$Path, [bool]$ReadOnly) {
     # 只读锁属于加固项：文件被运行中的应用占用 / 权限不足时会失败，
@@ -110,7 +132,7 @@ function Set-AppConfigFlags([string]$Path, [hashtable]$Patch) {
     }
     foreach ($k in $Patch.Keys) { $merged[$k] = $Patch[$k] }
     if (-not $merged.Contains('locale')) { $merged['locale'] = 'zh-CN' }
-    Write-Utf8 $Path (([pscustomobject]$merged | ConvertTo-Json -Depth 8) + "`n")
+    Write-Utf8 $Path (([pscustomobject]$merged | ConvertTo-Json -Depth 100) + "`n")
 }
 
 function Get-NowIso { return (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.000Z') }
@@ -192,8 +214,12 @@ function Resolve-Uid([string]$explicit, [string]$configDir, [string]$root) {
 
 # ---------- 解析 ----------
 $promptMap = @{ 'v4' = '寒霜v4.md'; 'v3' = '寒霜v3.md'; 'v2' = '寒霜v1.2.md' }
-if (-not $SourcePrompt) { $SourcePrompt = Join-Path $Root $promptMap[$Version] }
-if (-not (Test-Path -LiteralPath $SourcePrompt)) { throw "提示词文件不存在: $SourcePrompt" }
+# 本构建不再随包分发提示词：卸载/还原模式跳过提示词解析（还原逻辑对提示词缺失已有
+# 安全降级 —— 内容比对不上就保留用户记忆，见 -Uninstall 分支里的 $unSrc 说明）。
+if (-not ($Uninstall -or $RestoreMemory)) {
+    if (-not $SourcePrompt) { $SourcePrompt = Join-Path $Root $promptMap[$Version] }
+    if (-not (Test-Path -LiteralPath $SourcePrompt)) { throw "提示词文件不存在: $SourcePrompt" }
+}
 if (-not $SkillsSource) { $SkillsSource = if ($Version -eq 'v4') { 'codex-skills-v4' } else { 'codex-skills' } }
 $skillsSourceDir = Join-Path $Root $SkillsSource
 
@@ -261,7 +287,7 @@ function Set-SkillOverrides([string]$path, [string[]]$keys, [bool]$remove) {
             $obj.skillOverrides.PSObject.Properties.Remove($k); $changed = $true
         }
     }
-    if ($changed) { Write-Utf8 $path (($obj | ConvertTo-Json -Depth 12) + "`n") }
+    if ($changed) { Write-Utf8 $path (($obj | ConvertTo-Json -Depth 100) + "`n") }
 }
 function Get-SkillNames([string]$dir) {
     if (-not (Test-Path -LiteralPath $dir)) { return @() }
@@ -305,14 +331,14 @@ function Prune-StaleSkills([string]$Target, [string[]]$Previous, [string[]]$Curr
 
 # ---------- 状态 ----------
 if ($Status) {
-    $srcHash = Get-Sha $SourcePrompt
+    $srcHash = if ($SourcePrompt) { Get-Sha $SourcePrompt } else { '' }
     Write-Host "`n[状态]" -ForegroundColor Cyan
     $live = @($archFiles | Where-Object { Test-Path -LiteralPath $_ })
     if ($live.Count -eq 0) { Write-Host "  云记忆档案          : 未找到（该账号还没生成过记忆档案，或 WorkBuddy 未登录过）" }
     foreach ($af in $live) {
         $archText = Read-Utf8 $af
         $ver = [regex]::Match($archText, '(?m)^>\s*Version:\s*(\d+)').Groups[1].Value
-        $mb = [regex]::Match($archText, '(?s)## Memory Block\r?\n\r?\n(.*?)\r?\n\r?\n---').Groups[1].Value
+        $mb = Get-MemoryBlockBody $archText
         Write-Host "  云记忆档案          : $af"
         Write-Host "  档案 Version        : $(if ($ver) { $ver } else { '-' })"
         Write-Host "  memoryBlock 字符数  : $($mb.Trim().Length)  (上限 10000)"
@@ -331,9 +357,12 @@ if ($Status) {
     return
 }
 
-# ---------- 卸载 ----------
-if ($Uninstall) {
+# ---------- 卸载 / 装回原始记忆 ----------
+# 两条路径共用同一套还原逻辑：-Uninstall 全还原（含技能与记忆开关）；
+# -RestoreMemory 只还原记忆内容并停掉重注入，技能库与记忆开关原样保留。
+if ($Uninstall -or $RestoreMemory) {
     $done = @()
+    $anyRestore = $false
     # 目标档案 = 本次扫描到的 + 状态文件里记录过的（换账号/换机器后仍能清干净）
     $targets = New-Object System.Collections.Generic.List[string]
     foreach ($a in $archFiles) { if ($a) { $targets.Add($a) } }
@@ -344,18 +373,32 @@ if ($Uninstall) {
             if ($st.archive -and -not $targets.Contains($st.archive)) { $targets.Add($st.archive) }
         } catch { }
     }
+    # 卸载全程只读一次提示词原文：判「档案 / MEMORY.md 里是不是本工具的提示词」要用它。
+    # 读不到就留空串 —— 那时任何非空段都会被判成「不是提示词」而保留，方向是安全的。
+    $unSrc = ''
+    try { $unSrc = (Read-Utf8 $SourcePrompt).Trim() } catch { }
+
     foreach ($af in $targets) {
         Set-ArchiveReadOnly $af $false
         $bak = "$af.bak-inject"
         if (Test-Path -LiteralPath $bak) {
             Move-Item -LiteralPath $bak -Destination $af -Force
+            $anyRestore = $true
             $done += "档案已从备份还原: $(Split-Path -Leaf $af)"
         } elseif (Test-Path -LiteralPath $af) {
-            $uidNow = (Split-Path -Leaf $af) -replace '_memory\.md$', ''
-            $now = Get-NowIso
-            $empty = "# User Memory Profile`n> Last updated: $now`n> Version: $MEM_VERSION`n`n## Memory Block`n`n`n`n---`n`n<!-- RAW_JSON_START`n{`n  `"uid`": `"$uidNow`",`n  `"memoryBlock`": `"`",`n  `"updatedAt`": `"$now`",`n  `"version`": $MEM_VERSION`n}`nRAW_JSON_END -->`n"
-            Write-Utf8 $af $empty
-            $done += "档案 memoryBlock 已清空: $(Split-Path -Leaf $af)"
+            # 同 MEMORY.md：无备份时不能默认「档案是本工具建的」。安装时档案可能还不存在，
+            # 而现在的段内容已经不是提示词（记忆本来就存在 RAW_JSON 里，或 WorkBuddy 后续
+            # 写入了新记忆）—— 这时清空等于删用户的记忆，必须原样保留。
+    $curBlock = (Get-MemoryBlockBody (Read-Utf8 $af)).Trim()
+            if ($curBlock -ne $unSrc) {
+                $done += "档案已保留（无备份且内容不是提示词，是用户记忆）: $(Split-Path -Leaf $af)"
+            } else {
+                $uidNow = (Split-Path -Leaf $af) -replace '_memory\.md$', ''
+                $now = Get-NowIso
+                $empty = "# User Memory Profile`n> Last updated: $now`n> Version: $MEM_VERSION`n`n## Memory Block`n`n`n`n---`n`n<!-- RAW_JSON_START`n{`n  `"uid`": `"$uidNow`",`n  `"memoryBlock`": `"`",`n  `"updatedAt`": `"$now`",`n  `"version`": $MEM_VERSION`n}`nRAW_JSON_END -->`n"
+                Write-Utf8 $af $empty
+                $done += "档案 memoryBlock 已清空: $(Split-Path -Leaf $af)"
+            }
         }
     }
     if ($targets.Count -eq 0) { $done += '云记忆档案未执行（该账号还没有档案文件）' }
@@ -363,13 +406,25 @@ if ($Uninstall) {
 
     if (Test-Path -LiteralPath $fileMemBak) {
         Move-Item -LiteralPath $fileMemBak -Destination $fileMem -Force
+        $anyRestore = $true
         $done += 'MEMORY.md 已从备份还原'
     } elseif (Test-Path -LiteralPath $fileMem) {
-        Remove-Item -LiteralPath $fileMem -Force
-        $done += 'MEMORY.md 已删除（无备份）'
+        # 「没有安装前备份」不等于「这文件是本工具建的」：安装时它可能还不存在，是
+        # WorkBuddy 之后按会话重新写出来的用户记忆。只有内容确实等于随包提示词才删，
+        # 否则一律保留 —— 删掉就再也找不回来，用户看到的现象是「卸载把记忆一起卸了」。
+        if ($SourcePrompt -and (Get-Sha $fileMem) -eq (Get-Sha $SourcePrompt)) {
+            Remove-Item -LiteralPath $fileMem -Force
+            $done += 'MEMORY.md 已删除（内容是提示词，无备份）'
+        } else {
+            $done += 'MEMORY.md 已保留（无备份且内容不是提示词 —— 是用户自己的记忆）'
+        }
     }
 
-    if (Test-Path -LiteralPath $cfgBak) {
+    # 记忆开关只在真卸载时还原。装回原始记忆的意图是「用回我自己的记忆」——
+    # 把总闸关掉正好适得其反：记忆换回来了，却不再被读进对话。
+    if ($RestoreMemory) {
+        $done += 'app-config.json 未改动（记忆开关保持开启，装回的原始记忆才会被读进去）'
+    } elseif (Test-Path -LiteralPath $cfgBak) {
         Move-Item -LiteralPath $cfgBak -Destination $cfgFile -Force
         $done += 'app-config.json 已从备份还原'
     } elseif (Test-Path -LiteralPath $cfgFile) {
@@ -379,21 +434,44 @@ if ($Uninstall) {
 
     if (Test-Path -LiteralPath $manifestFile) {
         $manifest = Read-Utf8 $manifestFile | ConvertFrom-Json
-        $removed = 0; $kept = 0
-        foreach ($p in $manifest.skills.PSObject.Properties) {
-            $name = $p.Name; $sha = $p.Value.sha256
-            $dir = Join-Path $skillsDir $name
-            $skillMd = Join-Path $dir 'SKILL.md'
-            if ((Test-Path -LiteralPath $skillMd) -and (Get-Sha $skillMd) -eq $sha) {
-                Remove-Item -LiteralPath $dir -Recurse -Force; $removed++
-            } elseif (Test-Path -LiteralPath $dir) { $kept++ }
+        $names = @($manifest.skills.PSObject.Properties.Name)
+        if ($RestoreMemory) {
+            $done += "skills 目录保留（$($names.Count) 个，只装回记忆）"
+        } else {
+            $removed = 0; $kept = 0
+            foreach ($p in $manifest.skills.PSObject.Properties) {
+                $name = $p.Name; $sha = $p.Value.sha256
+                $dir = Join-Path $skillsDir $name
+                $skillMd = Join-Path $dir 'SKILL.md'
+                if ((Test-Path -LiteralPath $skillMd) -and (Get-Sha $skillMd) -eq $sha) {
+                    Remove-Item -LiteralPath $dir -Recurse -Force; $removed++
+                } elseif (Test-Path -LiteralPath $dir) { $kept++ }
+            }
+            Remove-Item -LiteralPath $manifestFile -Force
+            $done += "skills 已卸载 $removed 个（用户自行改过的保留 $kept 个）"
+            # 还原安装前被挪走的用户同名技能（安装时挪成了 <名>.bak-<时间戳>）
+            if ($manifest.backups) {
+                foreach ($p in $manifest.backups.PSObject.Properties) {
+                    $bak = [string]$p.Value
+                    if (-not (Test-Path -LiteralPath $bak)) { continue }
+                    $dest = Join-Path $skillsDir $p.Name
+                    if (Test-Path -LiteralPath $dest) {
+                        Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction SilentlyContinue
+                    }
+                    Move-Item -LiteralPath $bak -Destination $dest -Force
+                    $done += "已还原用户原有技能: $($p.Name)"
+                }
+            }
         }
-        Remove-Item -LiteralPath $manifestFile -Force
-        Set-SkillOverrides $settingsFile @($manifest.skills.PSObject.Properties.Name) $true
-        $done += "skills 已卸载 $removed 个（用户自行改过的保留 $kept 个）"
+        # 两种模式都要还原技能开关：装回原始记忆时寒霜技能同样该回到默认状态，
+        # 否则用户点完「装回」会发现自己的技能在 WorkBuddy 里依然是关着的。
+        Set-SkillOverrides $settingsFile $names $true
     } else { $done += 'skills 未执行（无安装清单）' }
 
-    Write-Host "`n[还原结果]" -ForegroundColor Green
+    if ($RestoreMemory -and -not $anyRestore) {
+        $done += '未找到安装前的记忆备份：当前记忆未被改动（本来就没注入过，或备份已被清理）'
+    }
+    Write-Host ("`n[{0}]" -f $(if ($RestoreMemory) { '装回原始记忆' } else { '还原结果' })) -ForegroundColor Green
     $done | ForEach-Object { Write-Host "  - $_" }
     if (Test-Path -LiteralPath $cfgFile) {
         $c = Read-Utf8 $cfgFile | ConvertFrom-Json
@@ -422,7 +500,7 @@ if ($archFiles.Count -gt 0) {
         $afBak = "$af.bak-inject"
         if ((Test-Path -LiteralPath $af) -and -not (Test-Path -LiteralPath $afBak)) {
             try {
-                $oldBlock = [regex]::Match((Read-Utf8 $af), '(?s)## Memory Block\r?\n\r?\n(.*?)\r?\n\r?\n---').Groups[1].Value.Trim()
+    $oldBlock = (Get-MemoryBlockBody (Read-Utf8 $af)).Trim()
                 if ($oldBlock -ne $srcText.Trim()) { Copy-Item -LiteralPath $af -Destination $afBak -Force }
             } catch { Write-Log "读取/备份档案失败(继续): $af" }
         }
@@ -490,9 +568,17 @@ if ($NoSkills) {
             if ($prevManifest.skills) { $prevSkills = @($prevManifest.skills.PSObject.Properties.Name) }
         } catch {}
     }
-    $manifest = [ordered]@{ source = $SkillsSource; installedAt = $now; prompt = (Split-Path -Leaf $SourcePrompt); skills = [ordered]@{} }
+    $manifest = [ordered]@{ source = $SkillsSource; installedAt = $now; prompt = (Split-Path -Leaf $SourcePrompt); skills = [ordered]@{}; backups = [ordered]@{} }
     foreach ($name in Get-SkillNames $skillsSourceDir) {
         $s = Join-Path $skillsSourceDir $name; $d = Join-Path $skillsDir $name
+        # 目标已有同名技能、且不在上次的安装清单里 = 用户自己的技能：
+        # 整目录挪到 <名>.bak-<时间戳>，卸载时再搬回来（否则 SKILL.md 会被静默覆盖）。
+        if ((Test-Path -LiteralPath $d) -and ($prevSkills -notcontains $name)) {
+            $bak = Join-Path $skillsDir ($name + '.bak-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+            Move-Item -LiteralPath $d -Destination $bak -Force
+            $manifest.backups[$name] = $bak
+            Write-Host "[$steps] 已备份同名技能 $name -> $(Split-Path -Leaf $bak)" -ForegroundColor Yellow
+        }
         if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
         Copy-Item -Path (Join-Path $s '*') -Destination $d -Recurse -Force
         $manifest.skills[$name] = [ordered]@{ sha256 = (Get-Sha (Join-Path $d 'SKILL.md')) }
@@ -534,7 +620,7 @@ Write-Host "`n[校验]" -ForegroundColor Cyan
 $ok = $true
 foreach ($af in @($archFiles | Where-Object { Test-Path -LiteralPath $_ })) {
     $t = Read-Utf8 $af
-    $blockOk = [regex]::Match($t, '(?s)## Memory Block\r?\n\r?\n(.*?)\r?\n\r?\n---').Groups[1].Value.Trim() -eq $srcText.Trim()
+    $blockOk = (Get-MemoryBlockBody $t).Trim() -eq $srcText.Trim()
     $rawOk = $t -match '"memoryBlock"'
     Write-Host "  档案 memoryBlock 可解析 : $blockOk  ($(Split-Path -Leaf $af))"
     Write-Host "  档案 RAW_JSON 存在      : $rawOk"

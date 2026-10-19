@@ -6,13 +6,21 @@ param(
     [string]$SkillsSource,
     [string]$WorkspacePath,
     [switch]$PatchSystemPrompt,
-    [switch]$Uninstall
+    [switch]$Uninstall,
+    # 只把注入的内容还原成原版（AGENTS.md / 记忆文件 / 系统提示词），
+    # 技能库与 install-state.json 一概不动。界面上的「装回原始记忆」按钮走这条路径。
+    [switch]$RestoreMemory
 )
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
+# 统一 UTF-8 输出：避免按系统代码页（GBK/437…）写 stdout 导致界面日志乱码
+try {
+    $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+} catch { }
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
 $script:hadError = $false
 
@@ -103,23 +111,26 @@ $agentsPath = Join-Path $ZcodeHome 'AGENTS.md'
 $statePath = Join-Path $ZcodeHome 'install-state.json'
 
 # 提示词源：默认取脚本旁的寒霜v1.2.md（完整版）/ AGENTS.md
-if ([string]::IsNullOrWhiteSpace($SourcePrompt)) {
-    $candidates = @(
-        (Join-Path $PSScriptRoot '寒霜v1.2.md'),
-        (Join-Path $PSScriptRoot 'AGENTS.md'),
-        (Join-Path (Split-Path -Parent $PSScriptRoot) 'AGENTS.md')
-    )
-    $SourcePrompt = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-}
-if (-not $SourcePrompt -or -not (Test-Path -LiteralPath $SourcePrompt -PathType Leaf)) {
-    throw "Prompt file not found. Pass -SourcePrompt or place AGENTS.md next to this script."
-}
+# 本构建不再随包分发提示词：卸载/还原模式跳过提示词解析。
+if (-not ($Uninstall -or $RestoreMemory)) {
+    if ([string]::IsNullOrWhiteSpace($SourcePrompt)) {
+        $candidates = @(
+            (Join-Path $PSScriptRoot '寒霜v1.2.md'),
+            (Join-Path $PSScriptRoot 'AGENTS.md'),
+            (Join-Path (Split-Path -Parent $PSScriptRoot) 'AGENTS.md')
+        )
+        $SourcePrompt = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    }
+    if (-not $SourcePrompt -or -not (Test-Path -LiteralPath $SourcePrompt -PathType Leaf)) {
+        throw "Prompt file not found. Pass -SourcePrompt or place AGENTS.md next to this script."
+    }
 
-# 记忆源：完整版提示词（寒霜v1.2.md），包装成 seagull-agents.md 记忆
-if ([string]::IsNullOrWhiteSpace($MemorySourcePrompt)) {
-    $MemorySourcePrompt = Join-Path $PSScriptRoot '寒霜v1.2.md'
-    if (-not (Test-Path -LiteralPath $MemorySourcePrompt)) {
-        $MemorySourcePrompt = $SourcePrompt
+    # 记忆源：完整版提示词（寒霜v1.2.md），包装成 seagull-agents.md 记忆
+    if ([string]::IsNullOrWhiteSpace($MemorySourcePrompt)) {
+        $MemorySourcePrompt = Join-Path $PSScriptRoot '寒霜v1.2.md'
+        if (-not (Test-Path -LiteralPath $MemorySourcePrompt)) {
+            $MemorySourcePrompt = $SourcePrompt
+        }
     }
 }
 
@@ -206,12 +217,12 @@ function Get-ZcodeSystemPromptPath {
 }
 
 $systemPromptPath = $null
-if ($PatchSystemPrompt -or $Uninstall) {
+if ($PatchSystemPrompt -or $Uninstall -or $RestoreMemory) {
     $systemPromptPath = Get-ZcodeSystemPromptPath
 }
 
-# ---------- 卸载 ----------
-if ($Uninstall) {
+# ---------- 卸载 / 装回原始记忆 ----------
+if ($Uninstall -or $RestoreMemory) {
     try {
         $hadState = Test-Path -LiteralPath $statePath
         $state = $null
@@ -271,8 +282,8 @@ if ($Uninstall) {
             }
         }
 
-        # 2.5 删除安装的技能（只删我们装的）
-        if ($state -and $state.installedSkills) {
+        # 2.5 删除安装的技能（只删我们装的）—— 「装回原始记忆」模式跳过：技能留着
+        if (-not $RestoreMemory -and $state -and $state.installedSkills) {
             $skillsTarget = Join-Path $ZcodeHome 'skills'
             foreach ($s in $state.installedSkills) {
                 $p = Join-Path $skillsTarget $s
@@ -333,7 +344,8 @@ if ($Uninstall) {
             Write-Host "System prompt file not found (ZCode 可能已卸载/换位置), skipped"
         }
 
-        Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
+        # state 里存着技能清单，装回原始记忆时必须留着，否则以后真卸载找不到该删哪些技能
+        if (-not $RestoreMemory) { Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue }
 
         # 4. 卸载结果校验（供上层 UI 显示真实状态）
         $verify = @()

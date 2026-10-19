@@ -1,8 +1,8 @@
 ﻿# =============================================================================
 #  寒霜破甲工具 · 清除全部注入提示词（零提示词）
 #
-#  六个目标（codex / zcode / cursor / claude / workbuddy / dsh）各有一套安装脚本、
-#  各有自己的注入点。这个脚本把它们全部还原到「没有注入过任何提示词」的状态。
+#  每个目标（codex / zcode / cursor / opencode / claude / workbuddy / dsh / doubao）
+#  各有一套安装脚本、各有自己的注入点。这个脚本把它们全部还原到「没有注入过任何提示词」的状态。
 #
 #  安全规则（硬约束，改脚本时不要放宽）：
 #    * 白名单式：只处理下面明确列出的注入点，不做「扫到像的就删」。
@@ -69,8 +69,10 @@ function Get-BundledPrompts {
   $script:BundledPrompts = $list
   return $list
 }
-function Test-InjectionArtifact([string]$path) {
-  try { $t = [IO.File]::ReadAllText($path) } catch { return $false }
+# 判定「这段文本就是本工具的提示词」。判据与 Test-InjectionArtifact 完全一致，
+# 只是作用在字符串上：WorkBuddy 记忆块必须在写回前判定「段内容」—— 档案里的
+# RAW_JSON 存的是用户记忆，拿整文件去判会把它一起卷进来。
+function Test-InjectionText([string]$t) {
   if ([string]::IsNullOrWhiteSpace($t)) { return $false }
   # 1) 硬标记
   if ($t -match 'HANSHUANG-INJECT' -or $t -match '寒霜破甲注入开始' -or $t -match '激活词（唯一例外') { return $true }
@@ -90,6 +92,10 @@ function Test-InjectionArtifact([string]$path) {
   # 产品会共用 few-shot 这类样板段），用户自己的文件 0/8。用 1 行当阈值会去删别家
   # 工具的注入文件 —— 那是越界，不是卸载。
   return ($best -ge 3)
+}
+function Test-InjectionArtifact([string]$path) {
+  try { $t = [IO.File]::ReadAllText($path) } catch { return $false }
+  return (Test-InjectionText $t)
 }
 # 摘掉注入块后只剩空白 / 残缺注释（例如注入时把文件截断留下的 "<!--"）时，
 # 视为「这份文件本来就是我们建的」，应当还原备份而不是留下这点垃圾
@@ -140,10 +146,12 @@ function Resolve-CodexHome {
 }
 $codexHome = Resolve-CodexHome
 $allHomes = [ordered]@{
-  codex  = $codexHome
-  zcode  = (Join-Path $H '.zcode')
-  claude = (Join-Path $H '.claude')
-  dsh    = (Join-Path $H '.dsh')
+  codex    = $codexHome
+  zcode    = (Join-Path $H '.zcode')
+  claude   = (Join-Path $H '.claude')
+  dsh      = (Join-Path $H '.dsh')
+  # OpenCode 的全局配置目录（与 install-opencode.ps1 的解析保持一致）
+  opencode = $(if ($env:XDG_CONFIG_HOME) { Join-Path $env:XDG_CONFIG_HOME 'opencode' } else { Join-Path $H '.config\opencode' })
 }
 function Want([string]$name) {
   return ($Targets.Count -eq 0) -or ($Targets -contains $name)
@@ -188,7 +196,8 @@ $markedAll = @(
   @{ T = 'codex'; Path = (Join-Path $codexHome 'AGENTS.md');  Begin = '<!-- 寒霜破甲注入开始'; End = '<!-- 寒霜破甲注入结束 -->' },
   @{ T = 'dsh';   Path = (Join-Path $H '.dsh\AGENTS.md');     Begin = '<!-- 寒霜破甲注入开始'; End = '<!-- 寒霜破甲注入结束 -->' },
   @{ T = 'zcode'; Path = (Join-Path $H '.zcode\AGENTS.md');   Begin = '<!-- 寒霜破甲注入开始'; End = '<!-- 寒霜破甲注入结束 -->' },
-  @{ T = 'claude';Path = (Join-Path $H '.claude\CLAUDE.md');  Begin = 'HANSHUANG-INJECT:BEGIN'; End = 'HANSHUANG-INJECT:END' }
+  @{ T = 'claude';Path = (Join-Path $H '.claude\CLAUDE.md');  Begin = 'HANSHUANG-INJECT:BEGIN'; End = 'HANSHUANG-INJECT:END' },
+  @{ T = 'opencode'; Path = (Join-Path $allHomes['opencode'] 'AGENTS.md'); Begin = 'HANSHUANG-INJECT:BEGIN'; End = 'HANSHUANG-INJECT:END' }
 )
 $marked = @($markedAll | Where-Object { Want $_.T })
 foreach ($m in $marked) {
@@ -408,7 +417,7 @@ foreach ($a in ($archives | Select-Object -Unique)) {
   $t = [IO.File]::ReadAllText($a)
   if ($t -notmatch '## Memory Block') { continue }
   if ($t -match '(?s)## Memory Block\s*\r?\n\r?\n\s*\r?\n') { Keep ("Memory Block 已是空段：{0}" -f $a); continue }
-  Plan 'WorkBuddy 记忆块' $a '清空 Memory Block 内容（档案文件本身保留）'
+  Plan 'WorkBuddy 记忆块' $a '清空 Memory Block 内容（执行时按段内容判定，是用户记忆则不动）'
 }
 
 # -----------------------------------------------------------------------------
@@ -553,7 +562,9 @@ $skillLibRoots = @(
   (Join-Path $bundleRoot 'codex-skills'),
   (Join-Path $bundleRoot 'codex-skills-v4'),
   (Join-Path $bundleRoot 'codex-skills-v5'),
-  $dshSkillLib   # DSH 的技能来自懒人包，不在这几个 codex 技能库里
+  $dshSkillLib,  # DSH 的技能来自懒人包，不在这几个 codex 技能库里
+  # 本构建随包分发的技能（Seep 逆向工作台）：codex / claude / opencode / dsh / workbuddy 都用它
+  (Join-Path $bundleRoot 'seep-kit\Tool\skill')
 )
 # workbuddy 的两个数据目录不在 $homes 里（它的注入点是单独处理的），但技能树的清理逻辑
 # 完全一样，这里补进来 —— 漏掉的话，WorkBuddy 里装的技能卸载后一个都清不掉（实测漏了 63 个）。
@@ -694,10 +705,30 @@ foreach ($p in $plan) {
         [IO.File]::WriteAllText($p.Path, $new.TrimEnd() + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
       }
       'WorkBuddy 记忆块' {
+        $t = [IO.File]::ReadAllText($p.Path)
+        # 判定必须用「执行这一刻」的段内容，不能沿用扫描时的结论：同一份档案很可能刚被
+        # 上面的「恢复原文」计划还原成用户原文（.bak-inject），此刻段里是空的、用户的记忆
+        # 在下面的 RAW_JSON 里。照旧无条件清空就会把刚还原回来的记忆整段吃掉
+        # （实测：888 字符的档案被吃到只剩 99 字符，RAW_JSON 连同用户记忆一起没了）。
+        # 只清「确实是提示词」的段，认不出就一个字节都不动。
+        # 结束锚点盯 RAW_JSON 注释，不盯「第一个空行+---」：提示词正文自带 markdown
+        # 分隔线（实测 17 个），非贪婪正则会在第一个 --- 处截断，于是只清掉前半段、后面
+        # 残留半截提示词。没有 RAW_JSON 标记的旧档案才回退到旧写法。
+        $strictPat = '(?s)## Memory Block[ \t]*\r?\n\r?\n(?<b>.*?)\r?\n\r?\n---\r?\n\r?\n<!--\s*RAW_JSON_START'
+        $m = [regex]::Match($t, $strictPat)
+        $strict = $m.Success
+        if (-not $strict) { $m = [regex]::Match($t, '(?s)## Memory Block[ \t]*\r?\n(?<b>.*?)(?=\r?\n\r?\n---|\z)') }
+        $body = $m.Groups['b'].Value
+        if (-not (Test-InjectionText $body)) { break }
         # WorkBuddyGuard 写入后会 chmod 444，先解只读
         try { $item = Get-Item -LiteralPath $p.Path -Force; if ($item.IsReadOnly) { $item.IsReadOnly = $false } } catch { }
-        $t = [IO.File]::ReadAllText($p.Path)
-        $new = [regex]::Replace($t, '(?s)(## Memory Block\s*\r?\n)\r?\n.*?(?=\r?\n\r?\n---|\z)', "`$1`r`n")
+        # 组 1 用 [ \t]* 而不是 \s*：\s* 会把分隔空行一并吞掉，段是空的时候前瞻就找不到
+        # (?=\r?\n\r?\n---)，.*? 于是一路吃到文件尾，把 RAW_JSON 整段删掉。
+        if ($strict) {
+            $new = [regex]::Replace($t, '(?s)(## Memory Block[ \t]*\r?\n)\r?\n.*?(?=\r?\n\r?\n---\r?\n\r?\n<!--\s*RAW_JSON_START)', "`$1`r`n")
+        } else {
+            $new = [regex]::Replace($t, '(?s)(## Memory Block[ \t]*\r?\n)\r?\n.*?(?=\r?\n\r?\n---|\z)', "`$1`r`n")
+        }
         [IO.File]::WriteAllText($p.Path, $new, [Text.UTF8Encoding]::new($false))
       }
       'WorkBuddy state' { Remove-Item -LiteralPath $p.Path -Force -ErrorAction Stop }

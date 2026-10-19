@@ -1,13 +1,21 @@
 ﻿[CmdletBinding()]
 param(
     [string]$SourcePrompt,
-    [switch]$Uninstall
+    [switch]$Uninstall,
+    # 只把注入的规则还原成原版（User Rules / 旧版 .cursorrules），其余一概不动。
+    # 界面上的「装回原始记忆」按钮走这条路径；Cursor 没有技能库，所以效果与 -Uninstall 相同。
+    [switch]$RestoreMemory
 )
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
+# 统一 UTF-8 输出：避免按系统代码页（GBK/437…）写 stdout 导致界面日志乱码
+try {
+    $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+} catch { }
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
 
 function Read-Utf8([string]$Path) {
@@ -175,7 +183,7 @@ function Test-IsPrimary([string]$Path) {
     return $false
 }
 
-if ($Uninstall) {
+if ($Uninstall -or $RestoreMemory) {
     try {
         $removedAny = $false
         $restoredAny = $false
@@ -218,7 +226,7 @@ if ($Uninstall) {
         if (-not ($removedAny -or $restoredAny)) {
             Write-Host "No Cursor rule injection found, nothing to do"
         }
-        Write-Host "Cursor 注入卸载完成"
+        Write-Host $(if ($RestoreMemory) { "原始规则已装回（Cursor）" } else { "Cursor 注入卸载完成" })
         exit 0
     } catch {
         Write-Host ("卸载失败: " + $_.Exception.Message) -ForegroundColor Red

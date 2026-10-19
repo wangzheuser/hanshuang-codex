@@ -25,7 +25,7 @@ const variant = process.argv[2] ||
   JSON.parse(readFileSync(join(appDir, "variant.json"), "utf8")).variant;
 
 /** 界面左上角与个人中心展示的版本号（与安装包文件名的版本无关）。 */
-const DISPLAY_VERSION = "1.0";
+const DISPLAY_VERSION = "2.0";
 
 const VARIANTS = {
   free: {
@@ -95,7 +95,9 @@ const buildCfg = {
   directories: { ...(base.directories || {}), output: cfg.output },
   // 打完应用目录、生成安装器之前跑：用 rcedit 写 exe 图标与版本信息
   afterPack: "scripts/after-pack.js",
-  win: { ...(base.win || {}), icon: cfg.icon },
+  // 本次打包只出便携版 zip：只生成 win-unpacked 应用目录（target "dir"），
+  // 不出 NSIS 安装器，也不出每次启动要自解压的 portable exe。
+  win: { ...(base.win || {}), icon: cfg.icon, target: ["dir"] },
   nsis: {
     ...(base.nsis || {}),
     shortcutName: cfg.appName,

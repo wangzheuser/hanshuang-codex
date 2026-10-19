@@ -10,13 +10,22 @@ param(
     [switch]$InjectAgents,
     # 分号分隔的其他提示词绝对路径：AGENTS.md 正文与之相同 = 之前手工贴的，可直接覆盖
     [string]$AgentsKnown,
-    [switch]$Uninstall
+    [switch]$Uninstall,
+    # 只把注入的内容还原成原版（config.toml 指针、AGENTS.md 注入块、记忆注入章节），
+    # 技能库 / 随附包 / install-state.json 一概不动。界面上的「装回原始记忆」按钮走这条路径。
+    [switch]$RestoreMemory
 )
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
+# 统一 UTF-8 输出：中文 Windows 的 PowerShell 默认按 GBK 写 stdout，别的区域设置更会把
+# 中文直接变成 '?'，界面日志就整段乱码。显式设成 UTF-8 后，调用方（桌面程序）也按 UTF-8 解。
+try {
+    $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+} catch { }
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
 
 # 目标已是最新时跳过整棵树的复制。重装时绝大多数文件没变，跳过能省掉全部磁盘写入 ——
@@ -110,7 +119,8 @@ if ([string]::IsNullOrWhiteSpace($CodexHome)) {
         } catch { }
     }
 }
-if ([string]::IsNullOrWhiteSpace($SourcePrompt)) {
+# 本构建不再随包分发提示词：卸载/还原模式不解析提示词文件，安装模式才要求它存在。
+if ([string]::IsNullOrWhiteSpace($SourcePrompt) -and -not ($Uninstall -or $RestoreMemory)) {
     $mdFiles = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.md' -File | Sort-Object Name)
     if ($mdFiles.Count -eq 0) {
         throw "No .md prompt file found in $PSScriptRoot"
@@ -121,7 +131,8 @@ if ([string]::IsNullOrWhiteSpace($SourcePrompt)) {
 $CodexHome = [System.IO.Path]::GetFullPath($CodexHome)
 $configPath = Join-Path $CodexHome 'config.toml'
 $managedDir = Join-Path $CodexHome 'managed-prompts'
-$targetPrompt = Join-Path $managedDir (Split-Path -Leaf $SourcePrompt)
+# 卸载/还原模式下 -SourcePrompt 可能为空，派生目标名会直接报错；空串由后面的清单过滤兜住
+$targetPrompt = if ([string]::IsNullOrWhiteSpace($SourcePrompt)) { '' } else { Join-Path $managedDir (Split-Path -Leaf $SourcePrompt) }
 $statePath = Join-Path $managedDir 'install-state.json'
 if ([string]::IsNullOrWhiteSpace($SkillsSource)) {
     $SkillsSource = Join-Path $PSScriptRoot 'codex-skills'
@@ -147,8 +158,32 @@ function Install-Skills {
     $dirs = Get-SkillDirs
     if ($dirs.Count -eq 0) { return $installed }
     New-Item -ItemType Directory -Force -Path $skillsTarget | Out-Null
+
+    # 上次由本工具装的技能名单 + 已备份的用户技能。
+    # 名单里没有的同名目录 = 用户自己的技能：先整目录挪到 <名>.bak-<时间戳>，
+    # 卸载时再原样搬回来（robocopy /MIR 会吃掉目标里多出来的文件，不留后路不可逆）。
+    $prevNames = @()
+    $script:backedUpSkills = @{}
+    if (Test-Path -LiteralPath $statePath) {
+        try {
+            $ps = Read-Utf8 $statePath | ConvertFrom-Json
+            if ($ps.installedSkills) { $prevNames = @($ps.installedSkills) }
+            if ($ps.backedUpSkills) {
+                foreach ($prop in $ps.backedUpSkills.PSObject.Properties) {
+                    $script:backedUpSkills[$prop.Name] = [string]$prop.Value
+                }
+            }
+        } catch {}
+    }
+
     foreach ($d in $dirs) {
         $dest = Join-Path $skillsTarget $d.Name
+        if ((Test-Path -LiteralPath $dest) -and ($prevNames -notcontains $d.Name)) {
+            $bak = Join-Path $skillsTarget ($d.Name + '.bak-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+            Move-Item -LiteralPath $dest -Destination $bak -Force
+            $script:backedUpSkills[$d.Name] = $bak
+            Write-Host ("Backed up existing skill " + $d.Name + " -> " + (Split-Path -Leaf $bak)) -ForegroundColor Yellow
+        }
         Copy-ManyFiles $d.FullName $dest
         $installed += $d.Name
     }
@@ -255,9 +290,13 @@ function Get-DisabledSkills {
     $result = @()
     if (-not (Test-Path -LiteralPath $configPath)) { return $result }
     $current = Read-Utf8 $configPath
-    $blocks = [regex]::Split($current, '(?m)^\[\[skills\.config\]\]\s*$')
-    for ($i = 1; $i -lt $blocks.Count; $i++) {
+    # 按段头切分，每块只到下一个段头之前 —— 不能切到下一个 [[skills.config]]：
+    # 那样块里会混进用户自己的 [mcp_servers.xxx] / [plugins.xxx] 段，它们的 path / enabled
+    # 会被当成这个技能条目的字段，禁用状态直接判反。
+    $blocks = [regex]::Split($current, '(?m)(?=^\[)')
+    for ($i = 0; $i -lt $blocks.Count; $i++) {
         $blk = $blocks[$i]
+        if (-not $blk.StartsWith('[[skills.config]]')) { continue }
         $mPath = [regex]::Match($blk, '(?m)^\s*path\s*=\s*"([^"]+)"')
         if (-not $mPath.Success) { continue }
         $mEn = [regex]::Match($blk, '(?m)^\s*enabled\s*=\s*(true|false)')
@@ -282,7 +321,11 @@ function Set-SkillsEnabledState([string[]]$DisabledNames) {
     # 比如自建技能库）必须原样保留 —— 早期写法是把所有块一起删掉再按清单重建，
     # 用户自己配的条目就这样永久丢了，而且他无从察觉。
     $skillsPrefix = $skillsTarget.Replace('\', '/').TrimEnd('/') + '/'
-    $blocks = [regex]::Split($current, '(?m)(?=^\[\[skills\.config\]\]\s*$)')
+    # 按「段头」切分：每一段只到下一个段头（[xxx] / [[xxx]]）之前。
+    # 不能写成「切到下一个 [[skills.config]]」—— 那样本工具的技能条目后面若跟着用户自己的
+    # [mcp_servers.xxx] / [plugins.xxx]，会被当成技能条目的一部分整段删掉，用户的 MCP 工具
+    # 就此消失，现象正是「卸载后 agent 连工具命令都不会调了」。
+    $blocks = [regex]::Split($current, '(?m)(?=^\[)')
     $kept = New-Object System.Collections.Generic.List[string]
     foreach ($b in $blocks) {
         if ($b.StartsWith('[[skills.config]]')) {
@@ -316,7 +359,9 @@ function Disable-NonManagedSkills([string[]]$ManagedNames) {
     return $toDisable
 }
 
-if ($Uninstall) {
+if ($Uninstall -or $RestoreMemory) {
+    # 文本比较用：换行符归一 + 去首尾空白（判断"用户装完后有没有自己改过"）
+    $normFn = { param($s) (($s -replace "`r`n", "`n").Trim()) }
     $hadState = Test-Path -LiteralPath $statePath
     $state = $null
     if ($hadState) {
@@ -358,7 +403,18 @@ if ($Uninstall) {
         $blk = Find-AgentsBlock $agentsText
         if ($blk) {
             $left = ($agentsText.Substring(0, $blk.Start) + $agentsText.Substring($blk.End)).Trim()
-            if ($left.Length -eq 0) {
+            # 安装前留的整份备份还在、且块外内容与它一致（用户装完后没自己改过）→ 整份还原，
+            # 做到逐字节回到安装前（换行符 / 末尾空行都不漂移）。
+            $agentsBak = $null
+            if ($state -and $state.agentsBackup) {
+                $cand = [string]$state.agentsBackup
+                if (Test-Path -LiteralPath $cand -PathType Leaf) { $agentsBak = $cand }
+            }
+            if ($agentsBak -and ((& $normFn $left) -eq (& $normFn (Read-Utf8 $agentsBak)))) {
+                Copy-Item -LiteralPath $agentsBak -Destination $agentsPath -Force
+                Remove-Item -LiteralPath $agentsBak -Force -ErrorAction SilentlyContinue
+                Write-Host "Restored original AGENTS.md byte-for-byte (pre-install backup consumed)"
+            } elseif ($left.Length -eq 0) {
                 Remove-Item -LiteralPath $agentsPath -Force -ErrorAction SilentlyContinue
                 Write-Host "Removed injected AGENTS.md (it only held the prompt)"
             } else {
@@ -367,16 +423,35 @@ if ($Uninstall) {
             }
         }
     }
-    Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
-    # 只移除寒霜安装的 skills，绝不动其他 skills
-    if ($state -and $state.installedSkills) {
-        Remove-Skills @($state.installedSkills)
-        Write-Host ("Removed managed skills: " + ($state.installedSkills -join ", "))
-    }
-    # 移除随附包（skills 树之外的自有目录）
-    if ($state -and $state.installedBundles) {
-        Remove-Bundles @($state.installedBundles)
-        Write-Host ("Removed managed bundles: " + ($state.installedBundles -join ", "))
+    # 「装回原始记忆」模式：技能和随附包都要留着，而技能清单就存在 state 里 ——
+    # 所以 state 也不能删，否则以后真卸载找不到该删哪些。
+    if ($RestoreMemory) {
+        Write-Host "Restore-memory: managed skills, bundles and install-state.json kept"
+    } else {
+        Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
+        # 只移除寒霜安装的 skills，绝不动其他 skills
+        if ($state -and $state.installedSkills) {
+            Remove-Skills @($state.installedSkills)
+            Write-Host ("Removed managed skills: " + ($state.installedSkills -join ", "))
+        }
+        # 把安装前属于用户自己的同名技能搬回来（安装时挪成了 <名>.bak-<时间戳>）
+        if ($state -and $state.backedUpSkills) {
+            foreach ($prop in $state.backedUpSkills.PSObject.Properties) {
+                $bak = [string]$prop.Value
+                if (-not (Test-Path -LiteralPath $bak)) { continue }
+                $dest = Join-Path $skillsTarget $prop.Name
+                if (Test-Path -LiteralPath $dest) {
+                    Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction SilentlyContinue
+                }
+                Move-Item -LiteralPath $bak -Destination $dest -Force
+                Write-Host ("Restored original skill: " + $prop.Name)
+            }
+        }
+        # 移除随附包（skills 树之外的自有目录）
+        if ($state -and $state.installedBundles) {
+            Remove-Bundles @($state.installedBundles)
+            Write-Host ("Removed managed bundles: " + ($state.installedBundles -join ", "))
+        }
     }
     # 清除 Codex 记忆注入段（memory_summary.md 中所有标题含「寒霜注入」的章节）
     $memSummary = Join-Path $CodexHome 'memories\memory_summary.md'
@@ -393,7 +468,10 @@ if ($Uninstall) {
             Write-Host "Memory cleanup skipped: $_"
         }
     }
-    # 恢复安装前的 skills 启用状态（卸载我们加的禁用条目，还原之前的禁用）
+    # 恢复安装前的 skills 启用状态（卸载我们加的禁用条目，还原之前的禁用）。
+    # 「装回原始记忆」模式**也要跑**：它只改 config.toml 里的启用条目，一个技能文件都不碰，
+    # 而用户点「装回」的诉求正是「让 AI 恢复原来的样子」—— 留着「非本工具技能一律禁用」
+    # 的条目，用户自己的技能在 Codex 里仍然是关着的，等于没装回来。
     $restoreDisabled = @()
     if ($state -and $state.previousDisabledSkills) {
         $restoreDisabled = @($state.previousDisabledSkills | Where-Object {
@@ -406,10 +484,24 @@ if ($Uninstall) {
     } else {
         Write-Host "All non-managed skills re-enabled"
     }
+    # config.toml 整份备份过：此刻禁用条目也清完了，内容与安装前一致（用户没改过）
+    # 就逐字节还原回去 —— 放在流程末尾，否则比对时文件里还留着我们加的 skills.config 段。
+    if ($state -and $state.configBackup) {
+        $cfgBak = [string]$state.configBackup
+        if (Test-Path -LiteralPath $cfgBak -PathType Leaf) {
+            $curNorm = & $normFn (Read-Utf8 $configPath)
+            $bakNorm = & $normFn (Read-Utf8 $cfgBak)
+            if ($curNorm -eq $bakNorm) {
+                Copy-Item -LiteralPath $cfgBak -Destination $configPath -Force
+                Remove-Item -LiteralPath $cfgBak -Force -ErrorAction SilentlyContinue
+                Write-Host "Restored original config.toml byte-for-byte (pre-install backup consumed)"
+            }
+        }
+    }
     if ($hadState -and (Test-Path -LiteralPath $managedDir) -and -not (Get-ChildItem -Force -LiteralPath $managedDir | Select-Object -First 1)) {
         Remove-Item -LiteralPath $managedDir -Force -ErrorAction SilentlyContinue
     }
-    Write-Host "Uninstalled managed prompt from $CodexHome"
+    Write-Host $(if ($RestoreMemory) { "Restored original prompt files under $CodexHome (skills kept)" } else { "Uninstalled managed prompt from $CodexHome" })
     exit 0
 }
 
@@ -445,6 +537,12 @@ if ($carriedState -and ($carriedState.PSObject.Properties.Name -contains 'previo
 }
 
 Copy-Item -LiteralPath $SourcePrompt -Destination $targetPrompt -Force
+
+# 整份备份 config.toml：卸载时能逐字节还原（只在首次安装留一份，重装不会把它覆盖成已注入版）
+$configBackup = Join-Path $managedDir 'config.toml.bak'
+if ($configExisted -and -not (Test-Path -LiteralPath $configBackup)) {
+    Copy-Item -LiteralPath $configPath -Destination $configBackup -Force
+}
 
 # 提示词里的 __CODEX_HOME__ 按本机实际安装位置展开（技能库 → <CODEX_HOME>\skills，
 # 随附包 → <CODEX_HOME>\breaker-kit）。不展开的话提示词会指向打包者的机器路径，
@@ -513,6 +611,7 @@ if ($InjectAgents) {
         # 用户自己的 AGENTS.md：先备份，再把块追加到末尾（不动原有内容）
         $bak = Join-Path $CodexHome ('AGENTS.md.backup-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
         Copy-Item -LiteralPath $agentsPath -Destination $bak -Force
+        $script:agentsBackup = $bak
         Write-Utf8NoBom $agentsPath ($existing.TrimEnd() + [Environment]::NewLine + [Environment]::NewLine + $block + [Environment]::NewLine)
         $agentsResult = 'appended (backup: ' + (Split-Path -Leaf $bak) + ')'
     }
@@ -614,6 +713,9 @@ $state = [ordered]@{
     previousLine = $previousLine
     installedSkills = $installedSkills
     installedBundles = $installedBundles
+    backedUpSkills = $(if ($script:backedUpSkills -and $script:backedUpSkills.Count -gt 0) { $script:backedUpSkills } else { $null })
+    agentsBackup = $script:agentsBackup
+    configBackup = $(if ($configExisted) { $configBackup } else { $null })
     previousDisabledSkills = $prevDisabled
 }
 Write-Utf8NoBom $statePath (($state | ConvertTo-Json -Depth 3) + [Environment]::NewLine)

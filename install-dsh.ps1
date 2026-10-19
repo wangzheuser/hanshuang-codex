@@ -6,13 +6,21 @@ param(
     # 指定则按「懒人包模式」部署：提示词取 <KitRoot>/materials/AGENTS.md，
     # 技能取 <KitRoot>/materials/skills，并附带 shield-protocol 与 prompt-inject 模板
     [string]$KitRoot,
-    [switch]$Uninstall
+    [switch]$Uninstall,
+    # 只把注入的内容还原成原版（AGENTS.md / 懒人包文件），
+    # 技能库与 install-state.json 一概不动。界面上的「装回原始记忆」按钮走这条路径。
+    [switch]$RestoreMemory
 )
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
+# 统一 UTF-8 输出：避免按系统代码页（GBK/437…）写 stdout 导致界面日志乱码
+try {
+    $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+} catch { }
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
 
 # 顶层错误捕获：任何失败打印原因并以非零码退出，界面能立即看到真实错误
@@ -89,7 +97,10 @@ $injectBak = Join-Path $managedDir 'prompt-inject.md.bak'
 $cfgBak = Join-Path $managedDir 'dsh-prompt-inject.json.bak'
 $markerBegin = if ($isKitMode) { '<!-- HANSHUANG-INJECT:BEGIN pack=' + $kitName + ' -->' } else { $marker }
 if ([string]::IsNullOrWhiteSpace($SkillsSource)) {
-    $SkillsSource = Join-Path $PSScriptRoot 'codex-skills'
+    # 随包技能库：本构建是 seep-kit\Tool\skill（老包回落到 codex-skills）。
+    # 卸载时不传 -SkillsSource，这里必须能自己算出来，否则清单过滤空转、技能清不掉。
+    $seepSkills = Join-Path $PSScriptRoot 'seep-kit\Tool\skill'
+    $SkillsSource = if (Test-Path -LiteralPath $seepSkills) { $seepSkills } else { Join-Path $PSScriptRoot 'codex-skills' }
 } else {
     $SkillsSource = Join-Path $PSScriptRoot $SkillsSource
 }
@@ -128,8 +139,32 @@ function Install-Skills {
     $dirs = Get-SkillDirs
     if ($dirs.Count -eq 0) { return $installed }
     New-Item -ItemType Directory -Force -Path $skillsTarget | Out-Null
+
+    # 上次由本工具装的技能名单 + 已备份的用户技能。
+    # 名单里没有的同名目录 = 用户自己的技能：先整目录挪到 <名>.bak-<时间戳>，
+    # 卸载时再原样搬回来（直接 Remove-Item 覆盖是不可逆的）。
+    $prevNames = @()
+    $script:backedUpSkills = @{}
+    if (Test-Path -LiteralPath $statePath) {
+        try {
+            $ps = Read-Utf8 $statePath | ConvertFrom-Json
+            if ($ps.installedSkills) { $prevNames = @($ps.installedSkills) }
+            if ($ps.backedUpSkills) {
+                foreach ($prop in $ps.backedUpSkills.PSObject.Properties) {
+                    $script:backedUpSkills[$prop.Name] = [string]$prop.Value
+                }
+            }
+        } catch {}
+    }
+
     foreach ($d in $dirs) {
         $dest = Join-Path $skillsTarget $d.Name
+        if ((Test-Path -LiteralPath $dest) -and ($prevNames -notcontains $d.Name)) {
+            $bak = Join-Path $skillsTarget ($d.Name + '.bak-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+            Move-Item -LiteralPath $dest -Destination $bak -Force
+            $script:backedUpSkills[$d.Name] = $bak
+            Write-Host ("Backed up existing skill " + $d.Name + " -> " + (Split-Path -Leaf $bak)) -ForegroundColor Yellow
+        }
         if (Test-SkillCurrent $d.FullName $dest) {
             $installed += $d.Name
             continue
@@ -183,7 +218,12 @@ function Install-Skills {
     # frontmatter 会被当成正文，技能同样加载不到（包里的 browser-automation /
     # docs-generator 就是这个毛病）。
     $noBom = New-Object System.Text.UTF8Encoding($false)
+    # 只处理「本工具分发过的技能」（上次清单 ∪ 本次安装）：用户自己放进来的目录
+    # 无论合规与否都不动 —— 否则用户一个没有 frontmatter 的自建技能会被当成
+    # "装了也用不了的垃圾"直接删掉（实测会丢数据）。
+    $ours = @($prevNames + $installed | Select-Object -Unique)
     foreach ($sk in (Get-ChildItem -LiteralPath $skillsTarget -Directory -ErrorAction SilentlyContinue)) {
+        if ($ours -notcontains $sk.Name) { continue }
         $skFile = Join-Path $sk.FullName 'SKILL.md'
         if (-not (Test-Path -LiteralPath $skFile)) { continue }
         $bytes = [System.IO.File]::ReadAllBytes($skFile)
@@ -248,8 +288,11 @@ function Get-NestedKitSkillNames {
 # 那些技能会永远留在目录里，所以不能只依赖清单。
 function Get-ShippedSkillNames {
     $names = @()
-    foreach ($lib in @('codex-skills', 'codex-skills-v3', 'codex-skills-v4', 'codex-skills-v5')) {
-        $dir = Join-Path $PSScriptRoot $lib
+    # 本构建的随包技能库是 seep-kit\Tool\skill（$skillsSource 已解析成绝对路径）；
+    # 老包才是 codex-skills*。两边都扫，卸载时才能算出该删哪些技能。
+    foreach ($lib in @($skillsSource, (Join-Path $PSScriptRoot 'codex-skills'), (Join-Path $PSScriptRoot 'codex-skills-v3'), (Join-Path $PSScriptRoot 'codex-skills-v4'), (Join-Path $PSScriptRoot 'codex-skills-v5'))) {
+        if ([string]::IsNullOrWhiteSpace($lib)) { continue }
+        $dir = if ([System.IO.Path]::IsPathRooted($lib)) { $lib } else { Join-Path $PSScriptRoot $lib }
         if (-not (Test-Path -LiteralPath $dir)) { continue }
         $names += @(Get-ChildItem -LiteralPath $dir -Directory -ErrorAction SilentlyContinue |
             Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'SKILL.md') } |
@@ -309,7 +352,7 @@ function Set-PromptInjectConfig([string]$CfgPath, [string]$TemplateId, [string]$
     }
     if ($MakeDefault -and [string]::IsNullOrWhiteSpace($default)) { $default = $TemplateId }
     $out = [pscustomobject]@{ templates = $templates; sessions = $sessions; defaultTemplate = $default }
-    Write-Utf8NoBom $CfgPath (($out | ConvertTo-Json -Depth 8) + "`n")
+    Write-Utf8NoBom $CfgPath (($out | ConvertTo-Json -Depth 100) + "`n")
 }
 
 # 懒人包模式的非技能文件部署（shield 载荷 + 注入模板）。
@@ -380,10 +423,11 @@ function Remove-Skills([string[]]$SkillNames) {
 }
 
 # 懒人包模式下提示词固定取包内 materials/AGENTS.md
-if ($isKitMode) {
+# 本构建不再随包分发提示词：卸载/还原模式跳过提示词解析。
+if ($isKitMode -and -not ($Uninstall -or $RestoreMemory)) {
     $SourcePrompt = $kitPrompt
 }
-if ([string]::IsNullOrWhiteSpace($SourcePrompt)) {
+if ([string]::IsNullOrWhiteSpace($SourcePrompt) -and -not ($Uninstall -or $RestoreMemory)) {
     $mdFiles = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.md' -File | Sort-Object Name)
     if ($mdFiles.Count -eq 0) {
         throw "No .md prompt file found in $PSScriptRoot"
@@ -402,11 +446,12 @@ if (Test-Path -LiteralPath $statePath) {
     } catch {}
 }
 
-if ($Uninstall) {
+if ($Uninstall -or $RestoreMemory) {
     # 0. 重复卸载兜底：上一次卸载如果在清理途中失败，状态文件可能已丢，
     # 但 marker 还在 —— 此时按「随包分发的技能 ∩ 技能目录里存在的」重建清单，
     # 否则残留的技能与包文件再也没人认领（点第二次「卸载」也清不掉）。
-    if ($prevSkills.Count -eq 0) {
+    # 「装回原始记忆」模式不删技能，这步兜底清点也跟着跳过
+    if (-not $RestoreMemory -and $prevSkills.Count -eq 0) {
         $leftover = @()
         foreach ($nm in Get-ShippedSkillNames) {
             if (Test-Path -LiteralPath (Join-Path $skillsTarget $nm)) { $leftover += $nm }
@@ -479,23 +524,42 @@ if ($Uninstall) {
             }
         }
     }
-    # 3. 删除同步安装的 skills（清单已在前面读好，这里不再依赖状态文件）
-    if ($prevSkills.Count -gt 0) {
-        $removedSkills = Remove-Skills $prevSkills
-        if ($removedSkills.Count -gt 0) {
-            Write-Host ("Removed managed skills: " + ($removedSkills -join ", "))
+    # 3./4. 技能删除与卸载墓碑 —— 「装回原始记忆」模式整段跳过：技能留着，
+    # 状态文件里的技能清单也必须留着，否则以后真卸载认不出该删哪些。
+    if ($RestoreMemory) {
+        Write-Host "Restore-memory: managed skills and install-state.json kept"
+    } else {
+        # 3. 删除同步安装的 skills（清单已在前面读好，这里不再依赖状态文件）
+        if ($prevSkills.Count -gt 0) {
+            $removedSkills = Remove-Skills $prevSkills
+            if ($removedSkills.Count -gt 0) {
+                Write-Host ("Removed managed skills: " + ($removedSkills -join ", "))
+            } else {
+                Write-Host "No managed skills to remove"
+            }
         } else {
             Write-Host "No managed skills to remove"
         }
-    } else {
-        Write-Host "No managed skills to remove"
-    }
-    # 4. 落墓碑记录：全部清理跑完才写，中途出错时状态文件仍在，重跑卸载还能接着清
-    try {
-        $tomb = @{ uninstalled = $true; $skillsManifestKey = $prevSkills }
-        Write-Utf8NoBom $statePath (($tomb | ConvertTo-Json -Depth 5) + "`n")
-    } catch {
-        Write-Host "Failed to write uninstall marker, next run will recover from disk"
+        # 把安装前属于用户自己的同名技能搬回来（安装时挪成了 <名>.bak-<时间戳>）
+        if ($prevState -and $prevState.backedUpSkills) {
+            foreach ($prop in $prevState.backedUpSkills.PSObject.Properties) {
+                $bak = [string]$prop.Value
+                if (-not (Test-Path -LiteralPath $bak)) { continue }
+                $dest = Join-Path $skillsTarget $prop.Name
+                if (Test-Path -LiteralPath $dest) {
+                    Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction SilentlyContinue
+                }
+                Move-Item -LiteralPath $bak -Destination $dest -Force
+                Write-Host ("Restored original skill: " + $prop.Name)
+            }
+        }
+        # 4. 落墓碑记录：全部清理跑完才写，中途出错时状态文件仍在，重跑卸载还能接着清
+        try {
+            $tomb = @{ uninstalled = $true; $skillsManifestKey = $prevSkills }
+            Write-Utf8NoBom $statePath (($tomb | ConvertTo-Json -Depth 5) + "`n")
+        } catch {
+            Write-Host "Failed to write uninstall marker, next run will recover from disk"
+        }
     }
     exit 0
 }
@@ -580,6 +644,9 @@ $state = @{
     kit                 = $isKitMode
     kitFiles            = $kitFiles
     prompt              = (Split-Path $SourcePrompt -Leaf)
+}
+if ($script:backedUpSkills -and $script:backedUpSkills.Count -gt 0) {
+    $state['backedUpSkills'] = $script:backedUpSkills
 }
 $__t2=[DateTime]::Now
 $stateJson = $state | ConvertTo-Json -Depth 5

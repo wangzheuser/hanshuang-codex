@@ -1,6 +1,6 @@
 {
   "name": "hanshuang-free",
-  "version": "4.4.0",
+  "version": "4.5.0",
   "private": true,
   "description": "寒霜破甲工具 · 桌面版",
   "main": "electron/main.cjs",
@@ -8,6 +8,7 @@
     "dev": "vite",
     "dev:electron": "electron .",
     "build": "vite build",
+    "scan:secrets": "node scripts/scan-secrets.mjs",
     "start": "npm run build && electron .",
     "dist": "node scripts/build.mjs"
   },
@@ -71,56 +72,18 @@
         "to": "install-dsh.ps1"
       },
       {
-        "from": "寒霜v5.md",
-        "to": "寒霜v5.md"
+        "from": "install-opencode.ps1",
+        "to": "install-opencode.ps1"
       },
       {
-        "from": "寒霜v4.md",
-        "to": "寒霜v4.md"
-      },
-      {
-        "from": "寒霜v4-claude.md",
-        "to": "寒霜v4-claude.md"
-      },
-      {
-        "from": "寒霜v3.md",
-        "to": "寒霜v3.md"
-      },
-      {
-        "from": "寒霜v1.2.md",
-        "to": "寒霜v1.2.md"
-      },
-      {
-        "from": "寒霜-变体B-v3-英文.md",
-        "to": "寒霜-变体B-v3-英文.md"
-      },
-      {
-        "from": "codex-skills-v4",
-        "to": "codex-skills-v4"
-      },
-      {
-        "from": "codex-skills",
-        "to": "codex-skills"
-      },
-      {
-        "from": "codex-skills-v5",
-        "to": "codex-skills-v5"
-      },
-      {
-        "from": "codex-bundle-v5",
-        "to": "codex-bundle-v5"
-      },
-      {
-        "from": "dsh-lazy-pack-v5",
-        "to": "dsh-lazy-pack-v5"
-      },
-      {
-        "from": "gpt-6-astra-v1/gpt-6-astra-v1",
-        "to": "gpt-6-astra-v1"
-      },
-      {
-        "from": "gpt-6-astra-v1/gpt-5.6-sol-unrestricted-v45.md",
-        "to": "gpt-6-astra-v1/gpt-5.6-sol-unrestricted-v45.md"
+        "from": "seep-kit",
+        "to": "seep-kit",
+        "filter": [
+          "**/*",
+          "!opencode.jsonc",
+          "!setup/cordis.generated.yml",
+          "!Tool/mcp/Tool/safe/playwright-mcp/tests/testserver/*.pem"
+        ]
       },
       {
         "from": "memory",

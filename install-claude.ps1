@@ -5,13 +5,21 @@ param(
     [string]$SkillsSource,
     # 分号分隔的其他提示词绝对路径：CLAUDE.md 正文与之相同 = 之前贴的就是提示词，可直接整份改写
     [string]$KnownPrompts,
-    [switch]$Uninstall
+    [switch]$Uninstall,
+    # 只把注入的内容还原成原版（CLAUDE.md 摘块），技能库与 install-state.json 一概不动。
+    # 界面上的「装回原始记忆」按钮走这条路径。
+    [switch]$RestoreMemory
 )
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
+# 统一 UTF-8 输出：避免按系统代码页（GBK/437…）写 stdout 导致界面日志乱码
+try {
+    $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+} catch { }
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
 
 # 顶层错误捕获：任何失败打印原因并以非零码退出，界面能立即看到真实错误
@@ -98,7 +106,11 @@ $backupPath = Join-Path $managedDir 'CLAUDE.md.bak'
 # 注入块的结束标记；开始标记由注入时生成，带提示词文件名（便于识别当前是哪一版）
 $markerEnd = '<!-- HANSHUANG-INJECT:END -->'
 if ([string]::IsNullOrWhiteSpace($SkillsSource)) {
-    $SkillsSource = Join-Path $PSScriptRoot 'codex-skills'
+    # 随包技能库：本构建是 seep-kit\Tool\skill（老包回落到 codex-skills）。
+    # 卸载时不会再传 -SkillsSource，这里必须能自己算出「本工具分发过哪些技能」，
+    # 否则卸载的清单过滤会空转，技能清不掉（实测踩过）。
+    $seepSkills = Join-Path $PSScriptRoot 'seep-kit\Tool\skill'
+    $SkillsSource = if (Test-Path -LiteralPath $seepSkills) { $seepSkills } else { Join-Path $PSScriptRoot 'codex-skills' }
 } else {
     $SkillsSource = Join-Path $PSScriptRoot $SkillsSource
 }
@@ -134,8 +146,34 @@ function Install-Skills {
     $dirs = Get-SkillDirs
     if ($dirs.Count -eq 0) { return $installed }
     New-Item -ItemType Directory -Force -Path $skillsTarget | Out-Null
+
+    # 上次由本工具装的技能名单 + 已备份的用户技能。
+    # 名单里没有的同名目录 = 用户自己的技能：先整目录挪到 <名>.bak-<时间戳>，
+    # 卸载时再原样搬回来。覆盖别人的技能却不留后路是不可逆的（实测踩过）。
+    $prevNames = @()
+    $script:backedUpSkills = @{}
+    $stPath = Join-Path $managedDir 'install-state.json'
+    if (Test-Path -LiteralPath $stPath) {
+        try {
+            $ps = Read-Utf8 $stPath | ConvertFrom-Json
+            if ($ps.installedSkills) { $prevNames = @($ps.installedSkills) }
+            if ($ps.backedUpSkills) {
+                foreach ($prop in $ps.backedUpSkills.PSObject.Properties) {
+                    $script:backedUpSkills[$prop.Name] = [string]$prop.Value
+                }
+            }
+        } catch {}
+    }
+
     foreach ($d in $dirs) {
         $dest = Join-Path $skillsTarget $d.Name
+        if ((Test-Path -LiteralPath $dest) -and ($prevNames -notcontains $d.Name)) {
+            # 用户自己的同名技能：备份而不是直接删
+            $bak = Join-Path $skillsTarget ($d.Name + '.bak-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+            Move-Item -LiteralPath $dest -Destination $bak -Force
+            $script:backedUpSkills[$d.Name] = $bak
+            Write-Host ("Backed up existing skill " + $d.Name + " -> " + (Split-Path -Leaf $bak)) -ForegroundColor Yellow
+        }
         if (Test-SkillCurrent $d.FullName $dest) {
             $installed += $d.Name
             continue
@@ -155,8 +193,12 @@ function Install-Skills {
 # 那些技能会永远留在目录里，所以不能只依赖清单。
 function Get-ShippedSkillNames {
     $names = @()
-    foreach ($lib in @('codex-skills', 'codex-skills-v3', 'codex-skills-v4', 'codex-skills-v5')) {
-        $dir = Join-Path $PSScriptRoot $lib
+    # 本构建的随包技能库来自 seep-kit\Tool\skill（$skillsSource 已解析好）；
+    # 老包才用 codex-skills*。两边都扫，卸载时才能算出该删哪些技能。
+    foreach ($lib in @($skillsSource, (Join-Path $PSScriptRoot 'codex-skills'), (Join-Path $PSScriptRoot 'codex-skills-v3'), (Join-Path $PSScriptRoot 'codex-skills-v4'), (Join-Path $PSScriptRoot 'codex-skills-v5'))) {
+        if ([string]::IsNullOrWhiteSpace($lib)) { continue }
+        # $skillsSource 已是绝对路径；codex-skills* 是相对 $PSScriptRoot 的目录名
+        $dir = if ([System.IO.Path]::IsPathRooted($lib)) { $lib } else { Join-Path $PSScriptRoot $lib }
         if (-not (Test-Path -LiteralPath $dir)) { continue }
         $names += @(Get-ChildItem -LiteralPath $dir -Directory -ErrorAction SilentlyContinue |
             Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'SKILL.md') } |
@@ -206,7 +248,8 @@ function Remove-Skills([string[]]$SkillNames) {
     return $removedSkills
 }
 
-if ([string]::IsNullOrWhiteSpace($SourcePrompt)) {
+# 本构建不再随包分发提示词：卸载/还原模式不解析提示词文件，安装模式才要求它存在。
+if ([string]::IsNullOrWhiteSpace($SourcePrompt) -and -not ($Uninstall -or $RestoreMemory)) {
     $mdFiles = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.md' -File | Sort-Object Name)
     if ($mdFiles.Count -eq 0) {
         throw "No .md prompt file found in $PSScriptRoot"
@@ -214,7 +257,7 @@ if ([string]::IsNullOrWhiteSpace($SourcePrompt)) {
     $SourcePrompt = $mdFiles[0].FullName
 }
 
-if ($Uninstall) {
+if ($Uninstall -or $RestoreMemory) {
     # 1. 摘掉注入块：只按标记删，块外用户自己写的内容原样保留。
     #    老版本是整份覆盖 + 整份还原备份，会把用户安装之后的编辑一起冲掉。
     if (Test-Path -LiteralPath $claudeMd) {
@@ -222,7 +265,16 @@ if ($Uninstall) {
         $blk = Find-InjectBlock $cur
         if ($blk) {
             $left = ($cur.Substring(0, $blk.Start) + $cur.Substring($blk.End)).Trim()
-            if ($left.Length -eq 0) {
+            # 安装前留的原始备份还在、且块外内容和它一致（= 用户装完之后没自己改过）时，
+            # 直接用备份整份还原，做到逐字节回到安装前的样子（换行符/末尾空行都不漂移）。
+            $managedBak = Join-Path $managedDir 'CLAUDE.md.bak'
+            $normFn = { param($s) (($s -replace "`r`n", "`n").Trim()) }
+            if ((Test-Path -LiteralPath $managedBak -PathType Leaf) -and
+                ((& $normFn $left) -eq (& $normFn (Read-Utf8 $managedBak)))) {
+                Copy-Item -LiteralPath $managedBak -Destination $claudeMd -Force
+                Remove-Item -LiteralPath $managedBak -Force -ErrorAction SilentlyContinue
+                Write-Host "Restored original CLAUDE.md byte-for-byte (pre-install backup consumed)"
+            } elseif ($left.Length -eq 0) {
                 # 摘完什么都不剩 = 这份文件本来就是我们建的：能找回干净的原始文件就还原，否则删掉。
                 # 注意用 Get-CleanClaudeBackup 而不是直接拿 managed-prompts 里那份备份 ——
                 # 那份备份本身可能就是更早的一次注入，还原它等于没卸载。
@@ -257,7 +309,12 @@ if ($Uninstall) {
     } else {
         Write-Host "No CLAUDE.md found, nothing to do"
     }
-    # 2. 删除同步安装的 skills
+    # 2. 删除同步安装的 skills —— 「装回原始记忆」模式跳过整块：技能要留着，
+    #    install-state.json（技能清单就存在里面）也必须一起留，否则以后真卸载找不到该删哪些。
+    if ($RestoreMemory) {
+        Write-Host "Restore-memory: managed skills and install-state.json kept"
+        exit 0
+    }
     $statePath = Join-Path $managedDir 'install-state.json'
     if (Test-Path -LiteralPath $statePath) {
         try {
@@ -268,6 +325,19 @@ if ($Uninstall) {
                     Write-Host ("Removed managed skills: " + ($removedSkills -join ", "))
                 } else {
                     Write-Host "No managed skills to remove"
+                }
+            }
+            # 把安装前属于用户自己的同名技能搬回来（安装时挪成了 <名>.bak-<时间戳>）
+            if ($state.backedUpSkills) {
+                foreach ($prop in $state.backedUpSkills.PSObject.Properties) {
+                    $bak = [string]$prop.Value
+                    if (-not (Test-Path -LiteralPath $bak)) { continue }
+                    $dest = Join-Path $skillsTarget $prop.Name
+                    if (Test-Path -LiteralPath $dest) {
+                        Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction SilentlyContinue
+                    }
+                    Move-Item -LiteralPath $bak -Destination $dest -Force
+                    Write-Host ("Restored original skill: " + $prop.Name)
                 }
             }
         } catch {
@@ -370,6 +440,9 @@ if ($staleSkills.Count -gt 0) {
 }
 
 $state = @{ $skillsManifestKey = $installedSkills }
+if ($script:backedUpSkills -and $script:backedUpSkills.Count -gt 0) {
+    $state['backedUpSkills'] = $script:backedUpSkills
+}
 $statePath = Join-Path $managedDir 'install-state.json'
 $stateJson = $state | ConvertTo-Json
 Write-Utf8NoBom $statePath $stateJson

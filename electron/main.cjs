@@ -2,8 +2,8 @@
 /*
   寒霜破甲工具 · Electron 主进程
 
-  功能逻辑与 fj_tool.py 保持一致：同样的 install*.ps1、同样的参数、同样的超时时间。
-  渲染进程通过 preload 暴露的 window.hs 调用下面的 IPC。
+  本构建已移除全部内置提示词与 V1–V5 版本：保留卸载 / 装回原始记忆 / 技能管理等
+  清理与维护能力。渲染进程通过 preload 暴露的 window.hs 调用下面的 IPC。
 */
 
 const { app, BrowserWindow, ipcMain, shell, Tray, Menu, nativeImage } = require("electron");
@@ -23,8 +23,10 @@ try {
 } catch {
   /* 开发环境缺文件时用默认值 */
 }
-const INSTALL_TIMEOUT = 300000;
 const UNINSTALL_TIMEOUT = 120000;
+const INSTALL_TIMEOUT = 600000;
+/** Seep 工作台首次部署要装 Python 依赖 + 解压离线包，给足 30 分钟。 */
+const SEEP_TIMEOUT = 1800000;
 
 let win = null;
 let tray = null;
@@ -47,6 +49,7 @@ const INSTALL_SCRIPTS = [
   "install-claude.ps1",
   "install-workbuddy.ps1",
   "install-dsh.ps1",
+  "install-opencode.ps1",
 ];
 
 function hasScripts(dir) {
@@ -125,6 +128,7 @@ const SCRIPTS = {
   codex: "install.ps1",
   zcode: "install-zcode.ps1",
   cursor: "install-cursor.ps1",
+  opencode: "install-opencode.ps1",
   claude: "install-claude.ps1",
   workbuddy: "install-workbuddy.ps1",
   // WorkBuddy 国内版：同一个脚本，靠 -ConfigDir 指到 ~/.workbuddy 区分
@@ -135,147 +139,152 @@ const SCRIPTS = {
 
 const TARGET_IDS = Object.keys(SCRIPTS);
 
-/**
-   Codex V5 双提示词（gpt-6-astra-v1）：界面上是一个版本，点安装时二选一 ——
-  「六」用 gpt-6-astra-v1.md，「5.6」用 gpt-5.6-sol-unrestricted-v45.md。
-  两份提示词都不引用 skills，所以走 -NoSkills 只注入提示词。
-  candidates 按顺序探测：开发环境是仓库里的原始嵌套目录，打包后在 resources/ 下。
-*/
-const ASTRA_PROMPTS = {
-  "codex-astra-6": {
-    label: "V5(六)",
-    name: "六 · GPT-6 Astra",
-    candidates: [
-      ["gpt-6-astra-v1", "gpt-6-astra-v1", "gpt-6-astra-v1.md"],
-      ["gpt-6-astra-v1", "gpt-6-astra-v1.md"],
-    ],
-  },
-  "codex-astra-56": {
-    label: "V5(5.6)",
-    name: "5.6 · GPT-5.6 Sol",
-    candidates: [
-      ["gpt-6-astra-v1", "gpt-5.6-sol-unrestricted-v45.md"],
-      ["gpt-5.6-sol-unrestricted-v45.md"],
-    ],
-  },
-};
-
-/** config.toml 里出现这些文件名 = 当前注入的是对应那一份（用于「已安装」标记）。 */
-const ASTRA_PROMPT_FILES = {
-  "gpt-6-astra-v1.md": "codex-astra-6",
-  "gpt-5.6-sol-unrestricted-v45.md": "codex-astra-56",
-};
 
 function p(...parts) {
   return path.join(toolDir(), ...parts);
 }
 
-/** 找到 V5 双提示词的真实路径；找不到返回 null，由调用方报错而不是静默装错文件。 */
-function astraPromptPath(entry) {
-  for (const parts of entry.candidates) {
-    const full = p(...parts);
+// ---------- 随包分发的 Seep 逆向工作台 ----------
+
+/** 工具链目录名：electron-builder 的 extraResources 把它整个落到 resources/seep-kit/。 */
+const SEEP_KIT = "seep-kit";
+/** 工作台技能库（apkseep / softseep / ida-reverse / 授权流审计），相对工具目录。 */
+const SEEP_SKILLS = SEEP_KIT + "/Tool/skill";
+/** 用户自己填提示词的目录，随包分发到 resources/memory/。 */
+const MEMORY_DIR = "memory";
+
+function seepScript(name) {
+  return p(SEEP_KIT, "setup", name);
+}
+
+/**
+   记忆文件 = memory/ 下第一个非空、非 README 的 .md。
+   返回 null 表示还没填，界面据此报错，避免把空提示词写进用户记忆档案。
+*/
+function memoryPrompt() {
+  const dir = p(MEMORY_DIR);
+  let names = [];
+  try {
+    names = fs
+      .readdirSync(dir)
+      .filter((n) => n.toLowerCase().endsWith(".md") && n.toLowerCase() !== "readme.md")
+      .sort();
+  } catch {
+    return null;
+  }
+  for (const name of names) {
     try {
-      if (fs.existsSync(full)) return full;
+      const full = path.join(dir, name);
+      const text = fs.readFileSync(full, "utf8");
+      const chars = text.trim().length;
+      if (chars > 0) return { path: full, name, chars };
     } catch {
-      /* 试下一个 */
+      /* 读不了就试下一个 */
     }
   }
   return null;
 }
 
-/** 判断某个记忆文件（AGENTS.md / CLAUDE.md）正文是不是「就是某份随包提示词」时用的候选清单。 */
-function knownPromptPaths() {
-  const list = [];
-  for (const entry of Object.values(ASTRA_PROMPTS)) {
-    const full = astraPromptPath(entry);
-    if (full) list.push(full);
+/** Seep 工作台是否已部署到 ~/.pi/agent（install-pi.ps1 会往 mcp.json 里写 seep 条目）。 */
+function seepState() {
+  const kitFile = p(SEEP_KIT, "VERSION");
+  let version = "";
+  try {
+    version = fs.readFileSync(kitFile, "utf8").trim();
+  } catch {
+    /* 随包文件缺失时留空 */
   }
-  for (const name of CODEX_PROMPT_NAMES.concat(["寒霜v4-claude.md"])) {
-    if (ASTRA_PROMPT_FILES[name]) continue; // 已在上面按候选路径处理过
-    try {
-      const full = p(name);
-      if (fs.existsSync(full)) list.push(full);
-    } catch {
-      /* 缺文件就跳过 */
-    }
+  let installed = false;
+  try {
+    const mcp = path.join(homeDir(), ".pi", "agent", "mcp.json");
+    installed = fs.existsSync(mcp) && fs.readFileSync(mcp, "utf8").includes('"seep"');
+  } catch {
+    /* 没装过 */
   }
-  return list;
+  return {
+    kit: fs.existsSync(seepScript("install.ps1")),
+    installed,
+    version,
+  };
 }
 
+/**
+   各目标的安装参数。提示词统一取 memory/ 里用户自己填的那一份；
+   技能库统一用随包的 Seep 工作台技能（cursor / doubao 没有技能库，只注入提示词）。
+*/
 function installArgs(targetId, promptFile) {
   const script = SCRIPTS[targetId];
   if (!script) throw new Error("未知目标: " + targetId);
   const file = p(script);
-  const prompt = p(promptFile);
-
+  const skills = SEEP_SKILLS;
   switch (targetId) {
-    case "codex": {
-      // 所有 Codex 版本都额外写一份到 <CodexHome>\AGENTS.md（Codex 原生全局指令文件；
-      // config.toml 会被 Codex 自己重写，AGENTS.md 不会丢）
-      const inject = ["-InjectAgents", "-AgentsKnown", knownPromptPaths().join(";")];
-      // V5 双提示词：按用户选的那一份注入，且不装任何 skills
-      const astra = ASTRA_PROMPTS[promptFile];
-      if (astra) {
-        const src = astraPromptPath(astra);
-        if (!src) throw new Error("找不到 V5 提示词文件：" + astra.candidates[0].join("/"));
-        return ["-File", file, "-SourcePrompt", src, "-NoSkills", ...inject];
-      }
-      const args = ["-File", file, "-SourcePrompt", prompt];
-      if (promptFile === "寒霜v5.md") {
-        // 技能库改用 v4：v5 那套（codex-skills-v5 / codex-bundle-v5）整个来自外部包
-        // 「codex＋Astra6破 v2」，已从仓库移除，不再作为分发内容
-        args.push("-SkillsSource", "codex-skills-v4");
-      } else {
-        args.push("-SkillsSource", "codex-skills-v4");
-      }
-      return [...args, ...inject];
-    }
-    case "zcode": {
-      const args = [
+    case "codex":
+      // 额外写一份 <CodexHome>\AGENTS.md：config.toml 会被 Codex 自己重写，AGENTS.md 不会丢
+      return [
+        "-File", file,
+        "-SourcePrompt", promptFile,
+        "-SkillsSource", skills,
+        "-InjectAgents",
+        "-AgentsKnown", promptFile,
+      ];
+    case "zcode":
+      return [
         "-File", file,
         "-PatchSystemPrompt",
-        "-SourcePrompt", prompt,
-        "-MemorySourcePrompt", prompt,
+        "-SourcePrompt", promptFile,
+        "-MemorySourcePrompt", promptFile,
+        "-SkillsSource", skills,
       ];
-      if (promptFile === "寒霜v4.md") args.push("-SkillsSource", "codex-skills-v4");
-      return args;
-    }
     case "claude":
-      // -KnownPrompts：CLAUDE.md 正文若本来就是某份随包提示词（手工贴过/老版本注入的），
-      // 允许整份改写成带标记的块，而不是当成用户内容追加
       return [
         "-File", file,
-        "-SourcePrompt", prompt,
-        "-SkillsSource", "codex-skills-v4",
-        "-KnownPrompts", knownPromptPaths().join(";"),
+        "-SourcePrompt", promptFile,
+        "-SkillsSource", skills,
+        "-KnownPrompts", promptFile,
+      ];
+    case "opencode":
+      // 全局规则写 ~/.config/opencode/AGENTS.md，技能落 ~/.config/opencode/skills
+      return [
+        "-File", file,
+        "-SourcePrompt", promptFile,
+        "-SkillsSource", skills,
+        "-KnownPrompts", promptFile,
       ];
     case "workbuddy":
-      return ["-File", file, "-SourcePrompt", prompt, "-SkillsSource", "codex-skills-v4"];
+      return ["-File", file, "-SourcePrompt", promptFile, "-SkillsSource", skills];
     case "workbuddy-cn":
-      // 国内版数据目录固定是 ~/.workbuddy，必须显式指定 ——
-      // 脚本的自动探测优先国际版（.workbuddy-ai），不指定的话国内版永远装不上。
+      // 国内版数据目录固定 ~/.workbuddy，自动探测会先命中 .workbuddy-ai
       return [
         "-File", file,
-        "-SourcePrompt", prompt,
-        "-SkillsSource", "codex-skills-v4",
+        "-SourcePrompt", promptFile,
+        "-SkillsSource", skills,
         "-ConfigDir", path.join(homeDir(), ".workbuddy"),
       ];
-    // DeepSeek Harness：注入 ~/.dsh/AGENTS.md + 同步 ~/.dsh/skills
     case "dsh":
-      return ["-File", file, "-SourcePrompt", prompt, "-SkillsSource", "codex-skills-v4"];
-    // 豆包：提示词写进云端全局记忆（AGENTS.md 式整份覆盖），不走本地文件、不需要技能库
-    case "doubao":
-      return ["-File", file, "-SourcePrompt", prompt];
-    case "cursor":
-      return ["-File", file, "-SourcePrompt", prompt];
+      return ["-File", file, "-SourcePrompt", promptFile, "-SkillsSource", skills];
     default:
-      return ["-File", file, "-SourcePrompt", prompt];
+      return ["-File", file, "-SourcePrompt", promptFile];
   }
 }
+
+
 
 function uninstallArgs(targetId) {
   const args = ["-File", p(SCRIPTS[targetId]), "-Uninstall"];
   // 国内版必须显式指定数据目录，否则卸载会走自动探测跑到国际版上去
+  if (targetId === "workbuddy-cn") args.push("-ConfigDir", path.join(homeDir(), ".workbuddy"));
+  return args;
+}
+
+/**
+   装回原始记忆（install-workbuddy.ps1 -RestoreMemory）：把云记忆档案与 MEMORY.md 还原成
+   安装前的原文，并删掉注入状态文件、让守护停止重注入；技能库和记忆开关都不动。
+   与卸载共用同一段还原逻辑，所以数据目录的指定方式必须和 uninstallArgs 保持一致。
+*/
+function restoreMemoryArgs(targetId) {
+  const args = ["-File", p(SCRIPTS[targetId]), "-RestoreMemory"];
+  // 本构建不再随包分发提示词：脚本在卸载/还原模式下跳过提示词解析（提示词缺失时按
+  // 「内容比对不上就保留用户记忆」安全降级），这里不再传 -SourcePrompt。
   if (targetId === "workbuddy-cn") args.push("-ConfigDir", path.join(homeDir(), ".workbuddy"));
   return args;
 }
@@ -360,6 +369,23 @@ function send(channel, payload) {
   if (win && !win.isDestroyed()) win.webContents.send(channel, payload);
 }
 
+/**
+   中文 Windows 上 PowerShell 子进程按系统代码页（GBK/936）写标准输出，
+   直接按 UTF-8 解会整段乱码（用户看到的「?????」日志就是这么来的）。
+   这里先按 UTF-8 严格解码；只要有一个非法字节就退回 GBK —— 两种来源都能读。
+*/
+function decodeConsoleOutput(buf) {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(buf);
+  } catch {
+    try {
+      return new TextDecoder("gbk").decode(buf);
+    } catch {
+      return buf.toString("utf8");
+    }
+  }
+}
+
 function killChild() {
   if (!child) return;
   const pid = child.pid;
@@ -380,9 +406,27 @@ function runPowerShell(args, label, timeoutMs) {
     if (childTimer) clearTimeout(childTimer);
 
     let out = "";
+    // 累计原始字节再整段解码：多字节中文字符可能被 chunk 边界切开，逐块解码会碎成乱码
+    let rawOut = Buffer.alloc(0);
+    let sentChars = 0;
     let timedOut = false;
     childLabel = label;
     send("tool:status", { label, state: "running" });
+
+    const onOutput = (buf) => {
+      rawOut = Buffer.concat([rawOut, buf]);
+      const text = decodeConsoleOutput(rawOut);
+      const delta = text.slice(sentChars);
+      sentChars = text.length;
+      if (rawOut.length > 4 * 1024 * 1024) {
+        // 超长输出：丢掉已经发过的前缀，免得内存一直涨
+        rawOut = rawOut.subarray(rawOut.length - 1024 * 1024);
+        sentChars = decodeConsoleOutput(rawOut).length;
+      }
+      if (!delta) return;
+      out = (out + delta).slice(-60000);
+      send("tool:log", { label, text: delta });
+    };
 
     const ps = spawn(
       "powershell.exe",
@@ -391,16 +435,8 @@ function runPowerShell(args, label, timeoutMs) {
     );
     child = ps;
 
-    ps.stdout.on("data", (buf) => {
-      const text = buf.toString("utf8");
-      out = (out + text).slice(-60000);
-      send("tool:log", { label, text });
-    });
-    ps.stderr.on("data", (buf) => {
-      const text = buf.toString("utf8");
-      out = (out + text).slice(-60000);
-      send("tool:log", { label, text });
-    });
+    ps.stdout.on("data", onOutput);
+    ps.stderr.on("data", onOutput);
 
     childTimer = setTimeout(() => {
       timedOut = true;
@@ -428,68 +464,11 @@ function runPowerShell(args, label, timeoutMs) {
 
 // ---------- 已安装状态 ----------
 
-/** 读 config.toml 判断 Codex 当前注入的是哪一版（对应 Python 版 _active_prompt_file）。 */
-/** Codex 各版本都会往 <CodexHome>\AGENTS.md 写带标记的注入块，标记行里带着提示词文件名。 */
-const CODEX_PROMPT_NAMES = [
-  ...Object.keys(ASTRA_PROMPT_FILES),
-  "寒霜v5.md",
-  "寒霜v4.md",
-  "寒霜v3.md",
-  "寒霜-变体B-v3-英文.md",
-  "寒霜v1.2.md",
-];
-
-function agentsPromptFile() {
-  let text = "";
-  try {
-    text = fs.readFileSync(path.join(codexHome(),"AGENTS.md"), "utf8");
-  } catch {
-    return null;
-  }
-  // 兼容早先写下的「寒霜破甲 V5 注入开始 · x.md」与现在的「寒霜破甲注入开始 · x.md」
-  const m = text.match(/<!--[^\n]*寒霜破甲[^\n]*注入开始[^\n]*-->/);
-  if (!m) return null;
-  for (const name of CODEX_PROMPT_NAMES) {
-    if (m[0].includes(name)) return name;
-  }
-  return null;
-}
-
-function activePromptFile() {
-  const cp = path.join(codexHome(),"config.toml");
-  let text = "";
-  try {
-    text = fs.readFileSync(cp, "utf8");
-  } catch {
-    text = "";
-  }
-  for (const name of CODEX_PROMPT_NAMES) {
-    if (text.includes(name)) return name;
-  }
-  // config.toml 里没有（Codex 重写 config.toml 会丢掉 model_instructions_file 行），
-  // 再认 AGENTS.md 的注入块
-  return agentsPromptFile();
-}
-
-const PROMPT_LABEL = {
-  // V5 双提示词：版本标识与磁盘文件名都要能映射到同一个展示名
-  "codex-astra-6": ASTRA_PROMPTS["codex-astra-6"].label,
-  "codex-astra-56": ASTRA_PROMPTS["codex-astra-56"].label,
-  "gpt-6-astra-v1.md": ASTRA_PROMPTS["codex-astra-6"].label,
-  "gpt-5.6-sol-unrestricted-v45.md": ASTRA_PROMPTS["codex-astra-56"].label,
-  // 付费版对外统一叫「付费版v1」，不暴露内部版本号
-  "寒霜v5.md": VARIANT === "pro" ? "付费版v1" : "V5",
-  "寒霜v4.md": "V4",
-  "寒霜v3.md": "V3",
-  "寒霜v1.2.md": "V2",
-  "寒霜-变体B-v3-英文.md": "v1",
-};
 
 function loadState() {
   const st = readJson(statePath(), {});
   return {
     installed: st.installed || {},
-    autoInstall: !!st.autoInstall,
   };
 }
 
@@ -501,12 +480,8 @@ function saveState(patch) {
 }
 
 function installedSnapshot() {
-  const st = loadState();
-  // Codex 以 config.toml 为准；其余用上次成功安装的记录
-  const codexFile = activePromptFile();
-  if (codexFile) st.installed.codex = PROMPT_LABEL[codexFile] || true;
-  else delete st.installed.codex;
-  return st;
+  // 提示词版本探测已随提示词一并移除，已安装标记只认安装时写下的状态记录。
+  return loadState();
 }
 
 // ---------- skills ----------
@@ -589,299 +564,92 @@ function listSkills() {
   });
 }
 
-// ---------- 压缩守护 ----------
-// 轮询 ~/.codex/sessions 下的 rollout-*.jsonl：命中压缩标记，或文件体积骤降，
-// 就提示用户重新发激活词。逻辑对齐 fj_tool.py 的 CompactionWatcher。
-
-const COMPACT_MARKERS = [
-  "compacted",
-  "compaction",
-  "summary of the conversation",
-  "conversation summary",
-  "对话已压缩",
-  "上下文已压缩",
-  "对话摘要",
-];
-
-const sessionsDir = () => path.join(codexHome(),"sessions");
-
-class CompactionWatcher {
-  constructor() {
-    this.known = new Map(); // path -> { size, pos }
-    this.drop = new Map(); // path -> [size, remainingPolls]
-    this.timer = null;
-  }
-
-  start() {
-    this.timer = setInterval(() => this.poll(), 5000);
-  }
-
-  stop() {
-    if (this.timer) clearInterval(this.timer);
-    this.timer = null;
-  }
-
-  files() {
-    const root = sessionsDir();
-    const out = [];
-    const walk = (dir) => {
-      let entries;
-      try {
-        entries = fs.readdirSync(dir, { withFileTypes: true });
-      } catch {
-        return;
-      }
-      for (const e of entries) {
-        const full = path.join(dir, e.name);
-        if (e.isDirectory()) walk(full);
-        else if (e.name.startsWith("rollout-") && e.name.endsWith(".jsonl")) out.push(full);
-      }
-    };
-    walk(root);
-    return out;
-  }
-
-  hasMarker(text) {
-    for (const line of text.split("\n")) {
-      if (!/"role"\s*:\s*"system"/.test(line)) continue;
-      const low = line.toLowerCase();
-      if (COMPACT_MARKERS.some((m) => low.includes(m))) return true;
-    }
-    return false;
-  }
-
-  poll() {
-    try {
-      for (const p of this.files()) {
-        let st;
-        try {
-          st = fs.statSync(p);
-        } catch {
-          continue;
-        }
-        const size = st.size;
-        const prev = this.known.get(p);
-        if (!prev) {
-          this.known.set(p, { size, pos: size });
-          continue;
-        }
-        let emit = false;
-        if (size > prev.pos) {
-          try {
-            const fd = fs.openSync(p, "r");
-            const len = size - prev.pos;
-            const buf = Buffer.alloc(len);
-            fs.readSync(fd, buf, 0, len, prev.pos);
-            fs.closeSync(fd);
-            if (this.hasMarker(buf.toString("utf8"))) emit = true;
-          } catch {
-            /* ignore */
-          }
-        }
-        if (!emit) {
-          if (prev.size > 20000 && size > 0 && size < prev.size * 0.6) {
-            this.drop.set(p, [size, 6]);
-          } else if (this.drop.has(p)) {
-            const d = this.drop.get(p);
-            if (size <= d[0]) {
-              emit = true;
-              this.drop.delete(p);
-            } else if (--d[1] <= 0) {
-              this.drop.delete(p);
-            }
-          }
-        }
-        if (emit) {
-          send("tool:notify", {
-            level: "warn",
-            text: "检测到上下文已压缩 — 重新发一次「寒霜」即可重新激活。",
-          });
-        }
-        this.known.set(p, { size, pos: size });
-      }
-      for (const p of [...this.known.keys()]) {
-        if (!fs.existsSync(p)) {
-          this.known.delete(p);
-          this.drop.delete(p);
-        }
-      }
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
-// ---------- WorkBuddy 云记忆守护 ----------
-// WorkBuddy 会把 memoryBlock 回写成空，导致注入被冲掉；这里定期比对并补写。
-
-class WorkBuddyGuard {
-  constructor() {
-    this.timer = null;
-    this.blockRe = /## Memory Block\r?\n\r?\n([\s\S]*?)\r?\n\r?\n---/;
-  }
-
-  start() {
-    this.timer = setInterval(() => this.check(), 45000);
-  }
-
-  stop() {
-    if (this.timer) clearInterval(this.timer);
-    this.timer = null;
-  }
-
-  state() {
-    for (const name of [".workbuddy-ai", ".workbuddy"]) {
-      const p = path.join(homeDir(), name, ".hanshuang-state.json");
-      if (fs.existsSync(p)) return readJson(p, null);
-    }
-    return null;
-  }
-
-  setReadonly(target, ro) {
-    try {
-      fs.chmodSync(target, ro ? 0o444 : 0o666);
-    } catch {
-      /* ignore */
-    }
-  }
-
-  targets(st) {
-    const list = (st.archives || []).filter(Boolean);
-    const one = st.archive || "";
-    if (one && !list.includes(one)) list.push(one);
-    const memDir = st.memoryDir || (list[0] ? path.dirname(list[0]) : "");
-    if (memDir && fs.existsSync(memDir)) {
-      try {
-        for (const n of fs.readdirSync(memDir)) {
-          if (n.endsWith("_memory.md") && !n.includes(".bak")) {
-            const p = path.join(memDir, n);
-            if (!list.includes(p)) list.push(p);
-          }
-        }
-      } catch {
-        /* ignore */
-      }
-    }
-    return list;
-  }
-
-  write(arch, block, st) {
-    const now = new Date().toISOString().replace(/\.\d+Z$/, ".000Z");
-    const ver = st.version ?? 999999;
-    let uid = st.uid || "";
-    if (fs.existsSync(arch)) {
-      try {
-        const m = fs.readFileSync(arch, "utf8").match(/"uid"\s*:\s*"([^"]+)"/);
-        if (m) uid = m[1];
-      } catch {
-        /* ignore */
-      }
-    }
-    if (!uid) uid = path.basename(arch).replace("_memory.md", "");
-    const profile = { uid, memoryBlock: block, updatedAt: now, version: ver };
-    const md =
-      `# User Memory Profile\n> Last updated: ${now}\n> Version: ${ver}\n\n` +
-      `## Memory Block\n\n${block}\n\n---\n\n` +
-      `<!-- RAW_JSON_START\n${JSON.stringify(profile, null, 2)}\nRAW_JSON_END -->\n`;
-    fs.mkdirSync(path.dirname(arch), { recursive: true });
-    if (fs.existsSync(arch)) this.setReadonly(arch, false);
-    fs.writeFileSync(arch, md, "utf8");
-    this.setReadonly(arch, true);
-  }
-
-  check() {
-    const st = this.state();
-    if (!st || !st.prompt) return;
-    const src = p(st.prompt);
-    if (!fs.existsSync(src)) return;
-    let block;
-    try {
-      block = fs.readFileSync(src, "utf8");
-    } catch {
-      return;
-    }
-    let fixed = 0;
-    for (const arch of this.targets(st)) {
-      let cur = "";
-      if (fs.existsSync(arch)) {
-        try {
-          cur = fs.readFileSync(arch, "utf8");
-        } catch {
-          cur = "";
-        }
-      }
-      const m = this.blockRe.exec(cur);
-      if (m && m[1].trim() === block.trim()) continue;
-      try {
-        this.write(arch, block, st);
-        fixed += 1;
-      } catch {
-        /* ignore */
-      }
-    }
-    if (fixed) {
-      send("tool:notify", {
-        level: "info",
-        text: `检测到 WorkBuddy 云记忆被回写/缺失，已自动补注入 ${fixed} 个档案。`,
-      });
-    }
-  }
-}
-
-const compactionWatcher = new CompactionWatcher();
-const workBuddyGuard = new WorkBuddyGuard();
 
 // ---------- IPC ----------
 
 function registerIpc() {
   ipcMain.handle("tool:state", () => ({
     installed: installedSnapshot().installed,
-    autoInstall: loadState().autoInstall,
     version: app.getVersion(),
     platform: plat.capabilities(),
   }));
 
-  ipcMain.handle("tool:install", async (_e, targetId, promptFile) => {
-    const label = `安装 ${targetId}`;
+  /** 记忆文件状态：界面用它显示「已填写 N 字 / 还没填」，安装前也会再查一次。 */
+  ipcMain.handle("tool:memory", () => memoryPrompt());
+
+  /**
+     安装：把 memory/ 里用户填的提示词注入目标，并同步随包的 Seep 工作台技能库。
+     记忆为空时直接失败 —— 宁可报错，也不要把空内容写进用户的 AGENTS.md / 记忆档案。
+     非 Windows 平台按能力表分派到 Node 注入器，不支持的平台提前给出原因。
+  */
+  ipcMain.handle("tool:install", async (_e, targetId) => {
+    const installed = installedSnapshot().installed;
+    if (!SCRIPTS[targetId]) {
+      return { ok: false, code: -1, timedOut: false, out: `未知的破甲目标：${targetId}`, installed };
+    }
     const exec = plat.executorFor(targetId);
-    if (exec === "unsupported") return unsupportedResult(targetId, label);
+    if (exec === "unsupported") return unsupportedResult(targetId, `安装 ${targetId}`);
+    const prompt = memoryPrompt();
+    if (!prompt) {
+      const dir = p(MEMORY_DIR);
+      const text = `记忆文件为空：请先把提示词粘进 ${dir} 下的 .md 文件，再点安装。`;
+      send("tool:status", { label: "记忆文件为空", state: "idle" });
+      send("tool:log", { label: "安装中止", text: text + "\n" });
+      return { ok: false, code: -1, timedOut: false, out: text, error: text, installed };
+    }
     if (exec === "node") {
       const res = runNodeInjector(
         plat.nodeInjector(targetId).install,
-        nodeInjectCtx(targetId, promptFile, label),
-        label
+        nodeInjectCtx(targetId, prompt.path, `安装 ${targetId}`),
+        `安装 ${targetId}`
       );
       if (res.ok) {
         const st = loadState();
-        st.installed[targetId] = PROMPT_LABEL[promptFile] || true;
+        st.installed[targetId] = prompt.name;
         saveState({ installed: st.installed });
       }
       return { ...res, installed: installedSnapshot().installed };
     }
-    let args;
-    try {
-      args = installArgs(targetId, promptFile);
-    } catch (e) {
-      // 参数准备失败（比如随包提示词缺失）也要回一个完整结果，界面才好显示原因
-      const msg = String((e && e.message) || e);
-      send("tool:log", { label, text: "\n[错误] " + msg + "\n" });
-      return {
-        ok: false,
-        code: -1,
-        out: msg,
-        timedOut: false,
-        error: msg,
-        installed: installedSnapshot().installed,
-      };
-    }
-    const res = await runPowerShell(args, label, INSTALL_TIMEOUT);
+    const res = await runPowerShell(installArgs(targetId, prompt.path), `安装 ${targetId}`, INSTALL_TIMEOUT);
     if (res.ok) {
       const st = loadState();
-      st.installed[targetId] = PROMPT_LABEL[promptFile] || true;
+      st.installed[targetId] = prompt.name;
       saveState({ installed: st.installed });
     }
     return { ...res, installed: installedSnapshot().installed };
   });
+
+  ipcMain.handle("seep:state", () => seepState());
+
+  /** 部署 Seep 工作台：解压离线依赖 + Python 依赖 + Pi/Claude/DSH 配置 + 自检。 */
+  ipcMain.handle("seep:install", async () => {
+    const script = seepScript("install.ps1");
+    if (!fs.existsSync(script)) {
+      const text = `随包缺少 Seep 工作台安装脚本：${script}`;
+      return { ok: false, code: -1, timedOut: false, out: text, error: text };
+    }
+    return runPowerShell(["-File", script, "-NonInteractive"], "部署 Seep 逆向工作台", SEEP_TIMEOUT);
+  });
+
+  ipcMain.handle("seep:uninstall", async () => {
+    const script = seepScript("uninstall.ps1");
+    if (!fs.existsSync(script)) {
+      const text = `随包缺少 Seep 工作台卸载脚本：${script}`;
+      return { ok: false, code: -1, timedOut: false, out: text, error: text };
+    }
+    // -Yes 跳过交互确认（主进程没法回话），保留用户自装技能与自己的配置
+    return runPowerShell(["-File", script, "-Yes"], "卸载 Seep 逆向工作台", SEEP_TIMEOUT);
+  });
+
+  ipcMain.handle("seep:verify", async () => {
+    const script = seepScript("verify.ps1");
+    if (!fs.existsSync(script)) {
+      const text = `随包缺少 Seep 工作台自检脚本：${script}`;
+      return { ok: false, code: -1, timedOut: false, out: text, error: text };
+    }
+    return runPowerShell(["-File", script, "-Detailed"], "Seep 工作台自检", SEEP_TIMEOUT);
+  });
+
 
   ipcMain.handle("tool:uninstall", async (_e, targetId) => {
     const label = `卸载 ${targetId}`;
@@ -934,6 +702,31 @@ function registerIpc() {
     return { ...res, installed: installedSnapshot().installed };
   });
 
+  // 装回原始记忆：把该目标的注入内容还原成原版，技能库保留。
+  //
+  // 这里**不跑** clearPromptsArgs 兜底清扫 —— 那个脚本连技能树一起清（它的职责是卸载后的
+  // 零残留），跟「只想换回原版」正好相反。注入内容本身也不需要它兜底：本 handler 与卸载
+  // 走同一段还原逻辑，各注入点（AGENTS.md / CLAUDE.md / config.toml / 记忆档案）都在里面处理掉了。
+  ipcMain.handle("tool:restoreMemory", async (_e, targetId) => {
+    if (!SCRIPTS[targetId]) {
+      return {
+        ok: false,
+        code: -1,
+        timedOut: false,
+        out: `未知的破甲目标：${targetId}`,
+        installed: installedSnapshot().installed,
+      };
+    }
+    const res = await runPowerShell(
+      restoreMemoryArgs(targetId),
+      `装回 ${targetId} 原始记忆`,
+      UNINSTALL_TIMEOUT,
+    );
+    // 不动 installed 记录：技能库还在，工具仍处于已安装状态 ——
+    // 想彻底回到安装前用「卸载」，这个按钮只负责把记忆换回来。
+    return { ...res, installed: installedSnapshot().installed };
+  });
+
   ipcMain.handle("tool:restartCodex", async () => {
     const cmd =
       "$ErrorActionPreference = 'SilentlyContinue'; " +
@@ -958,8 +751,13 @@ function registerIpc() {
       */
       const ps = spawn("powershell.exe", ["-NoProfile", "-Command", cmd], { windowsHide: true });
       let out = "";
-      ps.stdout.on("data", (buf) => (out += buf.toString("utf8")));
-      ps.stderr.on("data", (buf) => (out += buf.toString("utf8")));
+      let raw = Buffer.alloc(0);
+      const onChunk = (buf) => {
+        raw = Buffer.concat([raw, buf]);
+        out = decodeConsoleOutput(raw);
+      };
+      ps.stdout.on("data", onChunk);
+      ps.stderr.on("data", onChunk);
       ps.on("close", (code) => {
         const text = out.trim();
         const launched = /^launched:/m.test(text);
@@ -977,8 +775,6 @@ function registerIpc() {
 
   ipcMain.handle("tool:skills:list", () => listSkills());
   ipcMain.handle("tool:skills:save", (_e, disabled) => writeDisabledSkills(disabled || []));
-
-  ipcMain.handle("tool:autoInstall", (_e, value) => saveState({ autoInstall: !!value }));
 
   ipcMain.handle("tool:openQQ", async (_e, url) => {
     if (typeof url !== "string" || !/^https?:\/\//.test(url)) {
@@ -1096,10 +892,11 @@ async function captureAll(dir) {
   const shots = [
     ["codex", null],
     ["zcode", nav(1)],
-    ["workbuddy", nav(4)],
-    ["dsh", nav(5)],
-    ["skills", nav(6)],
-    ["tutorial", nav(7)],
+    ["workbuddy", nav(5)],
+    ["dsh", nav(7)],
+    ["seep", nav(9)],
+    ["skills", nav(10)],
+    ["tutorial", nav(11)],
     ["profile", 'document.querySelector(".app-nav-foot .settings-nav-item").click()'],
   ];
   // 截图前确保窗口真正可见并聚焦，否则 Chromium 会冻结 CSS 动画时间线
@@ -1163,7 +960,7 @@ async function captureAll(dir) {
   // 开发用：HS_INSTALLTEST=<targetId> 时在界面上真点一次「安装」，把状态与日志抓回来
   if (process.env.HS_INSTALLTEST) {
     const target = process.env.HS_INSTALLTEST;
-    const navIdx = { codex: 0, zcode: 1, cursor: 2, claude: 3, workbuddy: 4, dsh: 5 }[target];
+    const navIdx = { codex: 0, zcode: 1, cursor: 2, opencode: 3, claude: 4, workbuddy: 5, dsh: 7 }[target];
     if (navIdx !== undefined) {
       await win.webContents.executeJavaScript(
         `document.querySelectorAll(".settings-nav-scroll .settings-nav-item")[${navIdx}].click(), true`,
@@ -1230,7 +1027,7 @@ async function captureAll(dir) {
   // 开发用：HS_SKILLTEST=1 时点一次「保存」并断言全局提示出现（验收 Skills 保存反馈）
   if (process.env.HS_SKILLTEST) {
     await win.webContents.executeJavaScript(
-      'document.querySelectorAll(".settings-nav-scroll .settings-nav-item")[6].click(), true',
+      'document.querySelectorAll(".settings-nav-scroll .settings-nav-item")[10].click(), true',
     );
     await wait(500);
     const clicked = await win.webContents.executeJavaScript(`(() => {
@@ -1251,7 +1048,8 @@ async function captureAll(dir) {
   for (const [name, js] of shots) {
     if (js) {
       await win.webContents.executeJavaScript(js + ", true");
-      await wait(450);
+      // 页面重（技能列表 / 教程长文）时 450ms 会抓到上一页，留够渲染时间
+      await wait(1200);
     }
     const img = await win.webContents.capturePage();
     fs.writeFileSync(path.join(dir, name + ".png"), img.toPNG());
@@ -1325,8 +1123,6 @@ if (!app.requestSingleInstanceLock()) {
     registerIpc();
     createWindow();
     setupTray();
-    compactionWatcher.start();
-    workBuddyGuard.start();
   });
 
   app.on("window-all-closed", () => {
@@ -1337,8 +1133,6 @@ if (!app.requestSingleInstanceLock()) {
   app.on("before-quit", () => {
     quitting = true;
     killChild();
-    compactionWatcher.stop();
-    workBuddyGuard.stop();
     if (tray) {
       tray.destroy();
       tray = null;

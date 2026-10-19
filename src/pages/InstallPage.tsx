@@ -1,26 +1,27 @@
-import { useMemo, useState } from "react";
-
 import type { Target } from "../data/targets";
 import type { StatusLevel } from "../App";
+import type { MemoryPrompt } from "../lib/hs";
 import { cx } from "../lib/cx";
-import { IconCheck } from "../components/icons";
 
 type Props = {
   target: Target;
   installed?: string | boolean;
+  memory: MemoryPrompt;
   busy: boolean;
   status: string;
   level: StatusLevel;
   logText: string;
   unsupportedReason?: string;
-  onInstall: (file: string, label?: string) => void;
+  onInstall: () => void;
   onUninstall: () => void;
+  onRestoreMemory: () => void;
   onRestart: () => void;
 };
 
 export function InstallPage({
   target,
   installed,
+  memory,
   busy,
   status,
   level,
@@ -28,38 +29,10 @@ export function InstallPage({
   unsupportedReason = "",
   onInstall,
   onUninstall,
+  onRestoreMemory,
   onRestart,
 }: Props) {
-  const defaultIndex = useMemo(() => {
-    const i = target.versions.findIndex((v) => v.recommended);
-    return i >= 0 ? i : 0;
-  }, [target]);
-
-  const [index, setIndex] = useState(defaultIndex);
-  const selected = target.versions[index];
   const isInstalled = Boolean(installed);
-
-  // 一个版本对应多份提示词时（V5 的「六 / 5.6」），点安装先弹框选具体那一份
-  const choices = selected?.choices ?? [];
-  const [pickOpen, setPickOpen] = useState(false);
-  const [pickIndex, setPickIndex] = useState(0);
-  const picked = choices[pickIndex];
-
-  const startInstall = () => {
-    if (!selected) return;
-    if (choices.length > 0) {
-      setPickIndex(0);
-      setPickOpen(true);
-      return;
-    }
-    onInstall(selected.file, selected.name);
-  };
-
-  const confirmPick = () => {
-    if (!picked) return;
-    setPickOpen(false);
-    onInstall(picked.file, selected ? selected.name + " · " + picked.name : picked.name);
-  };
 
   return (
     <>
@@ -68,59 +41,31 @@ export function InstallPage({
       <div className="settings-card-block">
         <div className="settings-card-heading-row">
           <div>
-            <h2 className="settings-card-heading">
-              {target.versions.length > 1 ? "选择版本" : "版本"}
-            </h2>
+            <h2 className="settings-card-heading">版本</h2>
             <p className="settings-card-description">{target.desc}</p>
           </div>
           <span className={cx("badge", isInstalled ? "badge-success" : "badge-neutral")}>
             {isInstalled
-              ? "已安装" + (typeof installed === "string" ? " · " + installed : "")
+              ? "曾安装" + (typeof installed === "string" ? " · " + installed : "")
               : "未安装"}
           </span>
         </div>
 
-        {target.versions.length === 1 ? (
-          /* 只有一个版本时不做成可选项，直接展示将要注入的版本 */
-          <div className="settings-panel">
-            <div className="settings-row">
-              <span className="settings-row-copy">
-                <div className="settings-row-title">{selected?.name}</div>
-                <div className="settings-row-desc">{selected?.desc}</div>
-              </span>
-              <span className="settings-row-control">
-                <span className="badge badge-neutral">PRO</span>
-              </span>
-            </div>
-          </div>
-        ) : (
+        {/* 提示词来源：memory/ 下用户自己填的那一份 */}
         <div className="settings-panel">
-          {target.versions.map((v, i) => (
-            <button
-              key={v.file + v.name}
-              type="button"
-              className={cx("settings-row", "app-row-button", i === index && "app-row-selected")}
-              onClick={() => setIndex(i)}
-            >
-              <span className="settings-row-copy">
-                <div className="settings-row-title">
-                  {v.name}
-                  {v.choices && v.choices.length > 0 && (
-                    <span className="badge badge-neutral" style={{ marginLeft: 8 }}>
-                      二选一
-                    </span>
-                  )}
-                </div>
-                <div className="settings-row-desc">{v.desc}</div>
-              </span>
-              <span className="settings-row-control">
-                {v.recommended && <span className="badge badge-neutral">推荐</span>}
-                {i === index && <IconCheck size={16} />}
-              </span>
-            </button>
-          ))}
+          <div className="settings-row">
+            <span className="settings-row-copy">
+              <div className="settings-row-title">
+                {memory ? "记忆文件 · " + memory.name : "记忆文件 · 还没填"}
+              </div>
+              <div className="settings-row-desc">
+                {memory
+                  ? "已读取 " + memory.chars + " 字；安装时会连同 Seep 工作台技能库一起写入该目标。"
+                  : "把提示词粘进随包的 memory 目录下的 .md 文件（默认「破甲记忆.md」）后再点安装。"}
+              </div>
+            </span>
+          </div>
         </div>
-        )}
 
         {unsupportedReason && (
           <div className="panel-card" style={{ padding: "10px 12px", marginBottom: 12 }}>
@@ -131,14 +76,7 @@ export function InstallPage({
         )}
 
         <div className="app-inline-actions">
-          <button
-            type="button"
-            className="btn btn-primary"
-            disabled={busy || Boolean(unsupportedReason)}
-            onClick={startInstall}
-          >
-            {busy ? "执行中…" : isInstalled ? "重新安装" : "安装"}
-          </button>
+
           {target.id === "codex" && (
             <button
               type="button"
@@ -149,6 +87,24 @@ export function InstallPage({
               重启 Codex
             </button>
           )}
+          {/* 安装：提示词来自 memory/，技能库来自随包的 Seep 工作台 */}
+          <button
+            type="button"
+            className="btn btn-primary"
+            disabled={busy || Boolean(unsupportedReason)}
+            onClick={onInstall}
+          >
+            安装
+          </button>
+          {/* 装回原始记忆：只把注入的内容还原成原版，技能库保留 */}
+          <button
+            type="button"
+            className="btn btn-secondary"
+            disabled={busy || Boolean(unsupportedReason)}
+            onClick={onRestoreMemory}
+          >
+            装回原始记忆
+          </button>
           <button
             type="button"
             className="btn btn-ghost"
@@ -176,41 +132,6 @@ export function InstallPage({
           </div>
         ) : null}
       </div>
-
-      {pickOpen && (
-        <div className="overlay">
-          <div className="dialog">
-            <h2 className="settings-card-heading">选择要注入的 V5 提示词</h2>
-            <p className="settings-card-description">
-              {selected?.name} 有两份提示词，按你用的模型选一个；这版只写提示词，不安装任何 skills。
-            </p>
-            <div className="settings-panel">
-              {choices.map((c, i) => (
-                <button
-                  key={c.file + c.name}
-                  type="button"
-                  className={cx("settings-row", "app-row-button", i === pickIndex && "app-row-selected")}
-                  onClick={() => setPickIndex(i)}
-                >
-                  <span className="settings-row-copy">
-                    <div className="settings-row-title">{c.name}</div>
-                    <div className="settings-row-desc">{c.desc}</div>
-                  </span>
-                  <span className="settings-row-control">{i === pickIndex && <IconCheck size={16} />}</span>
-                </button>
-              ))}
-            </div>
-            <div className="app-inline-actions">
-              <button type="button" className="btn btn-primary" disabled={busy} onClick={confirmPick}>
-                安装 {picked?.name}
-              </button>
-              <button type="button" className="btn btn-ghost" onClick={() => setPickOpen(false)}>
-                取消
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </>
   );
 }
