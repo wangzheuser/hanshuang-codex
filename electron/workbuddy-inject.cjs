@@ -20,7 +20,14 @@ const crypto = require("node:crypto");
 const MEM_VERSION = 999999; // 高版本号：程序回写时 incoming < existing 会被判 stale_version 拒绝
 const SKILL_MANIFEST = ".hanshuang-skills.json";
 const SHIPPED_SKILL_LIBS = ["codex-skills", "codex-skills-v3", "codex-skills-v4", "codex-skills-v5"];
-const BLOCK_RE = /## Memory Block\r?\n\r?\n([\s\S]*?)\r?\n\r?\n---/;
+/*
+  区块结束锚点必须盯 RAW_JSON 注释，不能停在「空行 + ---」：
+  提示词正文自带大量 markdown 分隔线（这份有 17 个 ---），非贪婪匹配会在第一条
+  分隔线就截断（实测只取到 1112 / 79706 字符），导致校验永远失败、卸载也只清掉前半段。
+  旧格式（没有 RAW_JSON 注释）仍保留旧正则回退。
+*/
+const BLOCK_RE = /## Memory Block\r?\n\r?\n([\s\S]*?)\r?\n\r?\n---\r?\n\r?\n<!--\s*RAW_JSON_START/;
+const BLOCK_RE_LEGACY = /## Memory Block\r?\n\r?\n([\s\S]*?)\r?\n\r?\n---/;
 const DATA_DIR_NAMES = [".workbuddy-ai", ".workbuddy"];
 
 // ---------- 小工具 ----------
@@ -100,7 +107,14 @@ function resolveConfigDir(homeDir, explicit) {
 /** 本账户没有 WorkBuddy 数据时，扫其它账户目录（多用户机器 / 以别的名义运行）。 */
 function findOtherConfigDirs(homeDir, primary) {
   const found = [];
-  const roots = [path.dirname(homeDir), "/home", "/Users"];
+  /*
+    只扫「homeDir 的上一级」这一个用户根目录。
+    早先无条件追加 /home、/Users：预演、沙箱或自定义 HOME 时也会去扫这些绝对路径，
+    结果是读到真实账户的数据并往里写（实测沙箱测试直接写进了 ~/.workbuddy-ai）。
+    正常安装下 homeDir=/Users/<name>，上一级就是 /Users，跨账户能力不受影响。
+  */
+  const parent = path.dirname(homeDir);
+  const roots = homeDir === parent ? [] : [parent];
   const seen = new Set();
   for (const usersRoot of roots) {
     if (seen.has(usersRoot)) continue;
@@ -281,7 +295,8 @@ function uidOfArchive(file) {
 
 function memoryBlockOf(file) {
   try {
-    const m = BLOCK_RE.exec(readUtf8(file));
+    const text = readUtf8(file);
+    const m = BLOCK_RE.exec(text) || BLOCK_RE_LEGACY.exec(text);
     return m ? m[1].trim() : null;
   } catch {
     return null;

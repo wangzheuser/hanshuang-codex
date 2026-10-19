@@ -25,6 +25,9 @@ const EXECUTORS = {
   codex: { win32: "powershell", posix: "node" },
   zcode: { win32: "powershell", posix: "node" },
   cursor: { win32: "powershell", posix: null },
+  // v2.0 新增目标：漏登记会落到 executorFor 的兜底 "powershell"，在非 Windows 上
+  // 变成 spawn powershell.exe ENOENT（用户看到的是错误码而不是「暂不支持」）。
+  opencode: { win32: "powershell", posix: null },
   claude: { win32: "powershell", posix: null },
   workbuddy: { win32: "powershell", posix: "node" },
   "workbuddy-cn": { win32: "powershell", posix: "node" },
@@ -43,6 +46,7 @@ const NAV_LABEL = {
   codex: "Codex 破甲",
   zcode: "ZCode 破甲",
   cursor: "Cursor 破甲",
+  opencode: "OpenCode 破甲",
   claude: "Claude 破甲",
   workbuddy: "WorkBuddy 破甲（国际版）",
   "workbuddy-cn": "WorkBuddy 破甲（国内版）",

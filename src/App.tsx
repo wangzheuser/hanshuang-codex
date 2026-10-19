@@ -38,6 +38,15 @@ import { ProfilePage } from "./pages/ProfilePage";
 type ViewId = string; // target id | "skills" | "tutorial" | "profile"
 export type StatusLevel = "idle" | "busy" | "ok" | "err";
 
+/** 主进程各动作的统一返回形状（安装/卸载/还原/Seep 都够用）。 */
+export type ActionResult = {
+  ok: boolean;
+  code?: number;
+  error?: string;
+  out?: string;
+  installed?: InstalledMap;
+};
+
 /** 每个目标一个图标，全部取自 PI-Desktop 的 icons.tsx。 */
 const TARGET_ICONS: Record<string, typeof IconSparkles> = {
   codex: IconSparkles,
@@ -106,98 +115,136 @@ export function App() {
   }, []);
 
 
-  const runUninstall = useCallback(async (targetId: string) => {
-    setLogText("");
-    setStatus("正在卸载 …");
-    setLevel("busy");
-    setBusy(true);
-    const res = await hs.uninstall(targetId);
-    setInstalled(res.installed || {});
-    setStatus(res.ok ? "已卸载 · 技能已一并清除" : "卸载失败：" + (res.error || "退出码 " + res.code));
-    setLevel(res.ok ? "ok" : "err");
-    setBusy(false);
-    reloadSkills();
-  }, [reloadSkills]);
-
-  // 安装：提示词取 memory/ 里 user 自己填的那份，技能库取随包的 Seep 工作台
-  const runInstall = useCallback(async (targetId: string) => {
-    setLogText("");
-    setStatus("正在安装 …");
-    setLevel("busy");
-    setBusy(true);
-    const res = await hs.install(targetId);
-    setInstalled(res.installed || {});
-    if (res.ok) {
-      setStatus("已安装 · 提示词与技能库已写入");
-      setLevel("ok");
-    } else {
-      setStatus("安装失败（退出码 " + res.code + "）");
-      setLevel("err");
-      const reason = res.error || res.out || "";
-      if (reason.includes("记忆文件为空")) {
-        setToastLevel("error");
-        setToast("记忆文件为空：请先把提示词粘进 memory 目录下的 .md 文件");
-      }
-    }
-    setBusy(false);
-    reloadSkills();
-  }, [reloadSkills]);
-
-  /** Seep 工作台三个动作共用：装 / 卸 / 自检，结束后刷新状态。 */
-  const runSeep = useCallback(
-    async (action: "install" | "uninstall" | "verify") => {
+  /**
+    所有「执行一个动作」的入口共用这段：设忙碌态、兜住 IPC 拒绝、结束时复位。
+    主进程 handler 抛错时 invoke 会 reject —— 不在这里兜住，setBusy(false) 永远不执行，
+    界面就卡在「正在安装 …」，用户看不到任何原因（macOS 上踩过）。
+  */
+  const runAction = useCallback(
+    async (busyLabel: string, run: () => Promise<ActionResult>, onResult: (res: ActionResult) => void) => {
       setLogText("");
-      const label = { install: "正在部署 Seep 工作台 …", uninstall: "正在卸载 Seep 工作台 …", verify: "正在自检 …" }[action];
-      setStatus(label);
+      setStatus(busyLabel);
       setLevel("busy");
       setBusy(true);
-      const res =
-        action === "install"
-          ? await hs.seepInstall()
-          : action === "uninstall"
-            ? await hs.seepUninstall()
-            : await hs.seepVerify();
-      if (res.ok) {
-        setStatus(
-          action === "install" ? "Seep 工作台已部署" : action === "uninstall" ? "Seep 工作台已卸载" : "自检完成",
-        );
-        setLevel("ok");
-      } else {
-        setStatus((action === "verify" ? "自检失败" : action === "install" ? "部署失败" : "卸载失败") + "（退出码 " + res.code + "）");
+      try {
+        onResult(await run());
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        setStatus("操作失败：" + msg);
         setLevel("err");
+        setToastLevel("error");
+        setToast("操作失败：" + msg);
+      } finally {
+        setBusy(false);
+        reloadSkills();
       }
-      setBusy(false);
-      hs.seepState().then(setSeep);
-      reloadSkills();
     },
     [reloadSkills],
   );
 
-  // 装回原始记忆：只把安装前的记忆换回来，技能库保留（仅 WorkBuddy 有这个按钮）
-  const runRestoreMemory = useCallback(async (targetId: string) => {
-    setLogText("");
-    setStatus("正在装回原始记忆 …");
-    setLevel("busy");
-    setBusy(true);
-    const res = await hs.restoreMemory(targetId);
-    setInstalled(res.installed || {});
-    setStatus(res.ok ? "原始记忆已装回 · 自动重注入已暂停" : "装回失败（退出码 " + res.code + "）");
-    setLevel(res.ok ? "ok" : "err");
-    setBusy(false);
-  }, []);
+  const runUninstall = useCallback(
+    (targetId: string) =>
+      runAction(
+        "正在卸载 …",
+        () => hs.uninstall(targetId),
+        (res) => {
+          setInstalled(res.installed || {});
+          setStatus(res.ok ? "已卸载 · 技能已一并清除" : "卸载失败：" + (res.error || "退出码 " + res.code));
+          setLevel(res.ok ? "ok" : "err");
+        },
+      ),
+    [runAction],
+  );
 
-  const runRestart = useCallback(async () => {
-    setStatus("正在重启 Codex …");
-    setLevel("busy");
-    const res = await hs.restartCodex();
-    if (res.ok) {
-      setStatus("Codex 已重启");
-      setLevel("ok");
-    } else {
-      setStatus("重启失败：" + (res.error || "未知错误"));
-      setLevel("err");
-    }
-  }, []);
+  // 安装：提示词取 memory/ 里 user 自己填的那份，技能库取随包的 Seep 工作台
+  const runInstall = useCallback(
+    (targetId: string) =>
+      runAction(
+        "正在安装 …",
+        () => hs.install(targetId),
+        (res) => {
+          setInstalled(res.installed || {});
+          if (res.ok) {
+            setStatus("已安装 · 提示词与技能库已写入");
+            setLevel("ok");
+            return;
+          }
+          setStatus("安装失败（退出码 " + res.code + "）");
+          setLevel("err");
+          const reason = res.error || res.out || "";
+          if (reason.includes("记忆文件为空")) {
+            setToastLevel("error");
+            setToast("记忆文件为空：请先把提示词粘进 memory 目录下的 .md 文件");
+          } else if (reason.includes("只支持 Windows")) {
+            setToastLevel("error");
+            setToast("该功能暂不支持当前系统");
+          }
+        },
+      ),
+    [runAction],
+  );
+
+  /** Seep 工作台三个动作共用：装 / 卸 / 自检，结束后刷新状态。 */
+  const runSeep = useCallback(
+    (action: "install" | "uninstall" | "verify") => {
+      const busy = { install: "正在部署 Seep 工作台 …", uninstall: "正在卸载 Seep 工作台 …", verify: "正在自检 …" }[action];
+      const run =
+        action === "install" ? () => hs.seepInstall() : action === "uninstall" ? () => hs.seepUninstall() : () => hs.seepVerify();
+      return runAction(busy, run, (res) => {
+        if (res.ok) {
+          setStatus(
+            action === "install" ? "Seep 工作台已部署" : action === "uninstall" ? "Seep 工作台已卸载" : "自检完成",
+          );
+          setLevel("ok");
+        } else {
+          setStatus((action === "verify" ? "自检失败" : action === "install" ? "部署失败" : "卸载失败") + "（退出码 " + res.code + "）");
+          setLevel("err");
+          if ((res.error || "").includes("只支持 Windows")) {
+            setToastLevel("error");
+            setToast("Seep 工作台暂不支持当前系统");
+          }
+        }
+        hs.seepState().then(setSeep);
+      });
+    },
+    [runAction],
+  );
+
+  // 装回原始记忆：只把安装前的记忆换回来，技能库保留（仅 WorkBuddy 有这个按钮）
+  const runRestoreMemory = useCallback(
+    (targetId: string) =>
+      runAction(
+        "正在装回原始记忆 …",
+        () => hs.restoreMemory(targetId),
+        (res) => {
+          setInstalled(res.installed || {});
+          setStatus(res.ok ? "原始记忆已装回 · 自动重注入已暂停" : "装回失败（退出码 " + res.code + "）");
+          setLevel(res.ok ? "ok" : "err");
+          if ((res.error || "").includes("只支持 Windows")) {
+            setToastLevel("error");
+            setToast("装回原始记忆暂不支持当前系统");
+          }
+        },
+      ),
+    [runAction],
+  );
+
+  const runRestart = useCallback(
+    () =>
+      runAction(
+        "正在重启 Codex …",
+        () => hs.restartCodex(),
+        (res) => {
+          setStatus(res.ok ? "Codex 已重启" : "重启失败：" + (res.error || "未知错误"));
+          setLevel(res.ok ? "ok" : "err");
+          if (!res.ok && (res.error || "").includes("只支持 Windows")) {
+            setToastLevel("error");
+            setToast("重启 Codex 暂不支持当前系统");
+          }
+        },
+      ),
+    [runAction],
+  );
 
   const saveSkills = useCallback(
     async (disabled: string[]) => {

@@ -309,7 +309,8 @@ function nodeInjectCtx(targetId, promptFile, label) {
     toolDir: toolDir(), // 模块要的是解析后的目录字符串，不是 toolDir 函数本身
     homeDir: homeDir(),
     log,
-    sourcePrompt: p(promptFile),
+    // v2.0 起提示词来自 memory/（绝对路径）；早期实现传的是相对工具目录的路径
+    sourcePrompt: path.isAbsolute(promptFile) ? promptFile : p(promptFile),
   };
   if (targetId === "zcode") return { ...base, zcodeHome: "" };
   if (targetId === "codex") {
@@ -317,16 +318,17 @@ function nodeInjectCtx(targetId, promptFile, label) {
       ...base,
       codexHome: codexHome(),
       injectAgents: true,
-      agentsKnown: knownPromptPaths(),
-      // V5 双提示词只注入提示词、不装技能（与 installArgs 的 -NoSkills 一致）
-      noSkills: !!ASTRA_PROMPTS[promptFile],
-      skillsSourceDir: p("codex-skills-v4"),
+      // 老版本「已知提示词路径」清单已随 V5 提示词一起删除
+      agentsKnown: [],
+      // 技能库改用随包 Seep 工作台（与 installArgs 的 -SkillsSource 一致）
+      noSkills: false,
+      skillsSourceDir: p(SEEP_SKILLS),
     };
   }
   return {
     ...base,
-    skillsSourceName: "codex-skills-v4",
-    skillsSourceDir: p("codex-skills-v4"),
+    skillsSourceName: "seep-kit",
+    skillsSourceDir: p(SEEP_SKILLS),
     noSkills: false,
     uid: "",
     // 国内版数据目录固定 ~/.workbuddy，必须显式钉住，否则自动探测会跑到国际版上
@@ -352,6 +354,24 @@ function runNodeInjector(fn, ctx, label) {
 /** 该平台还没移植的目标：给可读原因，而不是 spawn ENOENT 的「退出码 -1」。 */
 function unsupportedResult(targetId, label) {
   const msg = plat.unsupportedMessage(targetId);
+  send("tool:log", { label, text: "\n[未适配] " + msg + "\n" });
+  return {
+    ok: false,
+    code: -1,
+    out: msg,
+    timedOut: false,
+    error: msg,
+    installed: installedSnapshot().installed,
+  };
+}
+
+/**
+   只有 PowerShell 实现、尚未移植到 macOS/Linux 的功能（装回原始记忆 / 重启 Codex /
+   Seep 工作台三个动作）：非 Windows 上直接回可读原因，而不是让 spawn 抛 ENOENT。
+*/
+function powershellOnlyResult(label) {
+  const name = plat.capabilities().platformName;
+  const msg = `${label} 目前只支持 Windows —— 该功能由 PowerShell 脚本实现，${name} 版还没移植。`;
   send("tool:log", { label, text: "\n[未适配] " + msg + "\n" });
   return {
     ok: false,
@@ -623,6 +643,7 @@ function registerIpc() {
 
   /** 部署 Seep 工作台：解压离线依赖 + Python 依赖 + Pi/Claude/DSH 配置 + 自检。 */
   ipcMain.handle("seep:install", async () => {
+    if (!plat.isWindows) return powershellOnlyResult("部署 Seep 逆向工作台");
     const script = seepScript("install.ps1");
     if (!fs.existsSync(script)) {
       const text = `随包缺少 Seep 工作台安装脚本：${script}`;
@@ -632,6 +653,7 @@ function registerIpc() {
   });
 
   ipcMain.handle("seep:uninstall", async () => {
+    if (!plat.isWindows) return powershellOnlyResult("卸载 Seep 逆向工作台");
     const script = seepScript("uninstall.ps1");
     if (!fs.existsSync(script)) {
       const text = `随包缺少 Seep 工作台卸载脚本：${script}`;
@@ -642,6 +664,7 @@ function registerIpc() {
   });
 
   ipcMain.handle("seep:verify", async () => {
+    if (!plat.isWindows) return powershellOnlyResult("Seep 工作台自检");
     const script = seepScript("verify.ps1");
     if (!fs.existsSync(script)) {
       const text = `随包缺少 Seep 工作台自检脚本：${script}`;
@@ -717,6 +740,7 @@ function registerIpc() {
         installed: installedSnapshot().installed,
       };
     }
+    if (!plat.isWindows) return powershellOnlyResult(`装回 ${targetId} 原始记忆`);
     const res = await runPowerShell(
       restoreMemoryArgs(targetId),
       `装回 ${targetId} 原始记忆`,
@@ -728,6 +752,7 @@ function registerIpc() {
   });
 
   ipcMain.handle("tool:restartCodex", async () => {
+    if (!plat.isWindows) return powershellOnlyResult("重启 Codex");
     const cmd =
       "$ErrorActionPreference = 'SilentlyContinue'; " +
       "$appId = (Get-StartApps | Where-Object { $_.AppID -like 'OpenAI.Codex*' } | Select-Object -First 1 -ExpandProperty AppID); " +
