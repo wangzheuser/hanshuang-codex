@@ -101,7 +101,9 @@ if ([string]::IsNullOrWhiteSpace($SkillsSource)) {
     # 卸载时不传 -SkillsSource，这里必须能自己算出来，否则清单过滤空转、技能清不掉。
     $seepSkills = Join-Path $PSScriptRoot 'seep-kit\Tool\skill'
     $SkillsSource = if (Test-Path -LiteralPath $seepSkills) { $seepSkills } else { Join-Path $PSScriptRoot 'codex-skills' }
-} else {
+} elseif (-not [System.IO.Path]::IsPathRooted($SkillsSource)) {
+    # 主进程在非 Windows 上会传入绝对路径。Join-Path 遇到已带根的路径，
+    # 在 PowerShell 7 / macOS 上会丢掉盘符之外的根，拼成脚本目录下的残路径。
     $SkillsSource = Join-Path $PSScriptRoot $SkillsSource
 }
 # 懒人包模式：技能取包内 materials/skills，忽略 -SkillsSource
@@ -359,9 +361,12 @@ function Set-PromptInjectConfig([string]$CfgPath, [string]$TemplateId, [string]$
 # 每个文件首次部署前备份进 managed-prompts，卸载时还原。
 function Install-KitFiles {
     $deployed = @()
+    # 先备份再覆盖。先复制再备份会把刚写入的注入内容存成「原文」，卸载还原不掉。
+    if ((Test-Path -LiteralPath $shieldDst) -and -not (Test-Path -LiteralPath $shieldBak)) {
+        Copy-Item -LiteralPath $shieldDst -Destination $shieldBak -Force
+    }
     Copy-Item -LiteralPath $shieldSrc -Destination $shieldDst -Force
     $deployed += 'shield-protocol.md'
-    if (-not (Test-Path -LiteralPath $shieldBak)) { Copy-Item -LiteralPath $shieldDst -Destination $shieldBak -Force }
     if (Test-Path -LiteralPath $injectDst) {
         if (-not (Test-Path -LiteralPath $injectBak)) { Copy-Item -LiteralPath $injectDst -Destination $injectBak -Force }
     }

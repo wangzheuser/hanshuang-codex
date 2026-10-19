@@ -313,6 +313,14 @@ function nodeInjectCtx(targetId, promptFile, label) {
     sourcePrompt: path.isAbsolute(promptFile) ? promptFile : p(promptFile),
   };
   if (targetId === "zcode") return { ...base, zcodeHome: "" };
+  if (targetId === "dsh") {
+    return {
+      ...base,
+      dshHome: "",
+      noSkills: false,
+      skillsSourceDir: p(SEEP_SKILLS),
+    };
+  }
   if (targetId === "codex") {
     return {
       ...base,
@@ -680,7 +688,8 @@ function registerIpc() {
     if (exec === "unsupported") return unsupportedResult(targetId, label);
     if (exec === "node") {
       // Node 卸载自己就把注入内容还原/删净（WorkBuddy 用 .bak-inject，ZCode 用
-      // AGENTS.md.backup-*），下面那段 PowerShell 兜底清扫在非 Windows 上必然 ENOENT，跳过。
+      // AGENTS.md.backup-*，DSH 用 managed-prompts/AGENTS.md.bak），
+      // 下面那段 PowerShell 兜底清扫在非 Windows 上必然 ENOENT，跳过。
       const res = runNodeInjector(
         plat.nodeInjector(targetId).uninstall,
         nodeInjectCtx(targetId, "", label),
@@ -740,7 +749,16 @@ function registerIpc() {
         installed: installedSnapshot().installed,
       };
     }
-    if (!plat.isWindows) return powershellOnlyResult(`装回 ${targetId} 原始记忆`);
+    if (!plat.isWindows) {
+      const injector = plat.nodeInjector(targetId);
+      if (injector && typeof injector.restoreMemory === "function") {
+        return {
+          ...runNodeInjector(injector.restoreMemory, nodeInjectCtx(targetId, "", `装回 ${targetId} 原始记忆`), `装回 ${targetId} 原始记忆`),
+          installed: installedSnapshot().installed,
+        };
+      }
+      return powershellOnlyResult(`装回 ${targetId} 原始记忆`);
+    }
     const res = await runPowerShell(
       restoreMemoryArgs(targetId),
       `装回 ${targetId} 原始记忆`,

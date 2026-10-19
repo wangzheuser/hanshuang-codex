@@ -11,6 +11,7 @@ const os = require("node:os");
 const wbInject = require("./workbuddy-inject.cjs");
 const zcInject = require("./zcode-inject.cjs");
 const cxInject = require("./codex-inject.cjs");
+const dshInject = require("./dsh-inject.cjs");
 
 const platform = process.platform; // win32 | darwin | linux
 const isWindows = platform === "win32";
@@ -31,7 +32,7 @@ const EXECUTORS = {
   claude: { win32: "powershell", posix: null },
   workbuddy: { win32: "powershell", posix: "node" },
   "workbuddy-cn": { win32: "powershell", posix: "node" },
-  dsh: { win32: "powershell", posix: null },
+  dsh: { win32: "powershell", posix: "node" },
   doubao: { win32: "powershell", posix: null },
 };
 
@@ -40,6 +41,7 @@ const NODE_MODULES = {
   zcode: zcInject,
   workbuddy: wbInject,
   "workbuddy-cn": wbInject,
+  dsh: dshInject,
 };
 
 const NAV_LABEL = {
